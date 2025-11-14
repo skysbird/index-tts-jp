@@ -185,6 +185,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Number of background worker threads for audio loading/resampling. 0 disables threading.",
     )
+    parser.add_argument(
+        "--audio-root",
+        type=Path,
+        default=None,
+        help="Root directory for resolving relative audio paths in manifest. Can be specified multiple times.",
+        action="append",
+    )
     return parser.parse_args()
 
 
@@ -516,15 +523,19 @@ def preprocess_dataset(
     processed = 0
     skipped = 0
     pending: List[Dict[str, Any]] = []
-    audio_roots = list(
-        dict.fromkeys(
-            [
-                Path(".").resolve(),
-                manifest_path.parent.resolve(),
-                manifest_path.parent.parent.resolve(),
-            ]
-        )
-    )
+    # Build audio root directories list
+    audio_roots_list = [
+        Path(".").resolve(),
+        manifest_path.parent.resolve(),
+        manifest_path.parent.parent.resolve(),
+    ]
+    # Add user-specified audio roots if provided
+    if args.audio_root:
+        for audio_root in args.audio_root:
+            audio_root_path = Path(audio_root).expanduser().resolve()
+            if audio_root_path.exists() and audio_root_path.is_dir():
+                audio_roots_list.append(audio_root_path)
+    audio_roots = list(dict.fromkeys(audio_roots_list))
 
     def flush(force: bool = False) -> None:
         nonlocal pending, processed, skipped
