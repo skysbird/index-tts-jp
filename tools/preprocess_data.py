@@ -22,6 +22,7 @@ import os
 import random
 import re
 import hashlib
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -378,6 +379,7 @@ def process_batch(
             try:
                 waveform, sr = future.result()
             except Exception:
+                traceback.print_exc()
                 skipped += 1
                 continue
             item["waveform"] = waveform
@@ -388,6 +390,7 @@ def process_batch(
             try:
                 waveform, sr = load_audio(item["audio_path"], target_sr=24000)
             except Exception:
+                traceback.print_exc()
                 skipped += 1
                 continue
             item["waveform"] = waveform
