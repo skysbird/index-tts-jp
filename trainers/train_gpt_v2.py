@@ -118,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help="Root directory for resolving relative audio paths in manifest. Can be specified multiple times.",
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Maximum number of samples to load from each manifest (0 = unlimited, useful for quick testing).",
+    )
     return parser.parse_args()
 
 
@@ -199,7 +205,7 @@ class Sample:
 
 
 class JapaneseGPTDataset(Dataset):
-    def __init__(self, manifests: Sequence[ManifestSpec]):
+    def __init__(self, manifests: Sequence[ManifestSpec], max_samples: int = 0):
         if isinstance(manifests, ManifestSpec):
             manifests = [manifests]
         manifest_list = list(manifests)
@@ -210,9 +216,16 @@ class JapaneseGPTDataset(Dataset):
         self.sample_type: str = "unknown"
         self.manifest_summaries: List[Dict[str, object]] = []
         self.bad_indices: Set[int] = set()
+        self.max_samples = max_samples  # 0 = unlimited
 
         for spec in manifest_list:
             self._load_single_manifest(spec)
+            # 如果设置了max_samples，在加载第一个manifest后检查
+            if self.max_samples > 0 and len(self.samples) >= self.max_samples:
+                # 截断到max_samples
+                self.samples = self.samples[:self.max_samples]
+                print(f"[Info] Limited to {self.max_samples} samples for quick testing.")
+                break
 
         if not self.samples:
             manifest_paths = ", ".join(str(spec.path) for spec in manifest_list)
@@ -341,6 +354,11 @@ class JapaneseGPTDataset(Dataset):
                     local_languages.add(sample.language)
                 if sample.prompt_language:
                     local_languages.add(sample.prompt_language)
+
+                # 如果设置了max_samples，检查是否达到限制
+                if self.max_samples > 0 and len(self.samples) >= self.max_samples:
+                    print(f"[Info] Reached max_samples limit ({self.max_samples}), stopping manifest loading.")
+                    break
 
                 if processed % progress_interval == 0:
                     print(
@@ -815,47 +833,50 @@ def compute_losses(
                     condition = batch["condition"].to(device)
                     cond_lengths = batch["condition_lengths"].to(device)
                 else:
-                    # 如果没有prompt_codes和预提取的conditioning，从音频提取
-                    if semantic_extractor is None or audio_roots is None:
+                    # 如果没有prompt_codes和预提取的conditioning，尝试从音频提取（需要semantic_extractor）
+                    if semantic_extractor is not None and audio_roots is not None:
+                        # 从prompt音频提取conditioning
+                        prompt_resolved_paths = []
+                        for idx, audio_path_str in enumerate(prompt_audio_paths):
+                            if not audio_path_str:
+                                raise ValueError(f"Empty prompt_audio_path in batch at index {idx}")
+                            resolved = resolve_audio_path(audio_path_str, audio_roots)
+                            if resolved is None:
+                                raise FileNotFoundError(
+                                    f"Prompt audio file not found: {audio_path_str} "
+                                    f"(searched in {[str(r) for r in audio_roots]})"
+                                )
+                            prompt_resolved_paths.append(resolved)
+                        
+                        prompt_waveforms = []
+                        prompt_sample_rates = []
+                        for audio_path in prompt_resolved_paths:
+                            wav, sr = torchaudio.load(audio_path)
+                            prompt_waveforms.append(wav)
+                            prompt_sample_rates.append(sr)
+                        
+                        prompt_feat, prompt_attention_mask = semantic_extractor.extract(
+                            prompt_waveforms, prompt_sample_rates
+                        )
+                        del prompt_waveforms, prompt_sample_rates
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        
+                        prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
+                        prompt_feat_t = prompt_feat.transpose(1, 2)
+                        condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+                        cond_lengths = prompt_cond_lengths
+                        del prompt_feat, prompt_feat_t, prompt_attention_mask
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                    else:
+                        # 如果既没有prompt_codes，也没有semantic_extractor，则必须使用预提取的conditioning
                         raise ValueError(
                             "For paired manifest with codes recovery, either prompt_codes, "
-                            "pre-extracted conditioning, or semantic_extractor+audio_roots "
-                            "must be provided for prompt conditioning."
+                            "pre-extracted conditioning (in batch), or semantic_extractor+audio_roots "
+                            "must be provided for prompt conditioning. "
+                            "Current: prompt_codes not in batch, semantic_extractor is None."
                         )
-                    # 从prompt音频提取conditioning
-                    prompt_resolved_paths = []
-                    for idx, audio_path_str in enumerate(prompt_audio_paths):
-                        if not audio_path_str:
-                            raise ValueError(f"Empty prompt_audio_path in batch at index {idx}")
-                        resolved = resolve_audio_path(audio_path_str, audio_roots)
-                        if resolved is None:
-                            raise FileNotFoundError(
-                                f"Prompt audio file not found: {audio_path_str} "
-                                f"(searched in {[str(r) for r in audio_roots]})"
-                            )
-                        prompt_resolved_paths.append(resolved)
-                    
-                    prompt_waveforms = []
-                    prompt_sample_rates = []
-                    for audio_path in prompt_resolved_paths:
-                        wav, sr = torchaudio.load(audio_path)
-                        prompt_waveforms.append(wav)
-                        prompt_sample_rates.append(sr)
-                    
-                    prompt_feat, prompt_attention_mask = semantic_extractor.extract(
-                        prompt_waveforms, prompt_sample_rates
-                    )
-                    del prompt_waveforms, prompt_sample_rates
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                    
-                    prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
-                    prompt_feat_t = prompt_feat.transpose(1, 2)
-                    condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
-                    cond_lengths = prompt_cond_lengths
-                    del prompt_feat, prompt_feat_t, prompt_attention_mask
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
                 
                 # 对于emo_vec，从target的codes恢复
                 feat, attention_mask = recover_features_from_codes(
@@ -1235,9 +1256,9 @@ def main() -> None:
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
 
     print("[Info] Loading training manifests...")
-    train_dataset = JapaneseGPTDataset(train_specs)
+    train_dataset = JapaneseGPTDataset(train_specs, max_samples=args.max_samples)
     print("[Info] Loading validation manifests...")
-    val_dataset = JapaneseGPTDataset(val_specs)
+    val_dataset = JapaneseGPTDataset(val_specs, max_samples=args.max_samples)
 
     manifest_metadata = {
         "train": [
