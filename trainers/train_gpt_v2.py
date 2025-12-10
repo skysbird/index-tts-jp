@@ -73,7 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size per optimisation step.")
     parser.add_argument("--grad-accumulation", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--epochs", type=int, default=10, help="Number of epochs.")
-    parser.add_argument("--learning-rate", type=float, default=2e-5, help="Initial learning rate.")
+    parser.add_argument("--learning-rate", type=float, default=2e-5, help="Initial/max learning rate (after warmup).")
+    parser.add_argument("--min-learning-rate", type=float, default=0.0, help="Minimum learning rate for cosine decay (0.0 = decay to zero).")
     parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="LR warmup steps.")
     parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
@@ -706,6 +707,22 @@ def main() -> None:
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     total_steps = args.max_steps if args.max_steps > 0 else args.epochs * max(1, len(train_loader)) // max(1, args.grad_accumulation)
     total_steps = max(total_steps, 1)
+    steps_per_epoch = max(1, len(train_loader)) // max(1, args.grad_accumulation)
+    
+    # 打印训练步数信息
+    print(f"[Info] Training configuration:")
+    print(f"  - Total samples: {len(train_dataset)}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Gradient accumulation: {args.grad_accumulation}")
+    print(f"  - Steps per epoch: {steps_per_epoch}")
+    print(f"  - Total epochs: {args.epochs}")
+    print(f"  - Total training steps: {total_steps}")
+    print(f"  - Warmup steps: {args.warmup_steps} ({100.0 * args.warmup_steps / total_steps:.1f}% of total)")
+    print(f"  - Learning rate schedule: {args.learning_rate} (max) -> {args.min_learning_rate if args.min_learning_rate > 0 else 0.0} (min)")
+    if args.min_learning_rate > 0:
+        print(f"  - Cosine decay will reach min_lr at step {total_steps}")
+    
+    # 创建学习率调度器
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
@@ -793,6 +810,17 @@ def main() -> None:
                 else:
                     optimizer.step()
                 scheduler.step()
+                
+                # 如果设置了最小学习率，手动调整（因为 transformers 的调度器默认衰减到 0）
+                if args.min_learning_rate > 0 and global_step > args.warmup_steps:
+                    # 计算余弦衰减的进度（warmup 之后的部分）
+                    progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                    # 余弦衰减：从 max_lr 衰减到 min_lr
+                    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                    current_lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine_decay
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = current_lr
+                
                 optimizer.zero_grad(set_to_none=True)
 
                 global_step += 1
