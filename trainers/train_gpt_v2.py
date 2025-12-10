@@ -41,6 +41,9 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.maskgct_utils import build_semantic_model
+from transformers import SeamlessM4TFeatureExtractor
+import torchaudio
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +106,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore pre-extracted conditioning and emotion vectors, use zeros instead (useful when pretrained model language doesn't match training data).",
     )
+    parser.add_argument(
+        "--audio-root",
+        dest="audio_roots",
+        action="append",
+        type=str,
+        help="Root directory for resolving relative audio paths in manifest. Can be specified multiple times.",
+    )
     return parser.parse_args()
 
 
@@ -137,6 +147,29 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
 
 
+def resolve_audio_path(audio_value: str, audio_roots: List[Path]) -> Optional[Path]:
+    """
+    解析音频路径，支持绝对路径和相对路径
+    
+    Args:
+        audio_value: 音频路径字符串（可能是绝对或相对路径）
+        audio_roots: 音频根目录列表，用于解析相对路径
+    
+    Returns:
+        解析后的绝对路径，如果找不到则返回None
+    """
+    path = Path(audio_value).expanduser()
+    if path.is_file():
+        return path
+    
+    audio_rel = Path(audio_value)
+    for root in audio_roots:
+        candidate = (root / audio_rel).expanduser()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 @dataclass
 class Sample:
     id: str
@@ -153,6 +186,7 @@ class Sample:
     language: Optional[str] = None
     prompt_language: Optional[str] = None
     manifest_path: Optional[Path] = None
+    audio_path: Optional[str] = None
 
 
 class JapaneseGPTDataset(Dataset):
@@ -242,6 +276,7 @@ class JapaneseGPTDataset(Dataset):
                         language=target_language,
                         prompt_language=prompt_language,
                         manifest_path=manifest_path,
+                        audio_path=record.get("audio_path"),
                     )
                 else:
                     language = self._normalize_language(record.get("language") or spec.language)
@@ -360,6 +395,7 @@ class JapaneseGPTDataset(Dataset):
                     "language": sample.language,
                     "prompt_language": sample.prompt_language,
                     "manifest_path": str(sample.manifest_path) if sample.manifest_path else "",
+                    "audio_path": sample.audio_path if sample.audio_path else "",
                 }
 
             except (FileNotFoundError, OSError, ValueError) as exc:
@@ -380,6 +416,83 @@ class JapaneseGPTDataset(Dataset):
                 continue
 
         raise RuntimeError("Exceeded retry budget while sampling training data.")
+
+
+class SemanticExtractor:
+    """从音频提取语义特征的提取器（参照 tools/preprocess_data.py）"""
+    def __init__(self, stats_path: Path, device: torch.device):
+        self.device = device
+        self.feature_extractor = SeamlessM4TFeatureExtractor.from_pretrained(
+            "facebook/w2v-bert-2.0"
+        )
+        self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
+            path_=stats_path
+        )
+        self.semantic_model = self.semantic_model.to(device)
+        self.semantic_mean = self.semantic_mean.to(device)
+        self.semantic_std = self.semantic_std.to(device)
+        # 设置为eval模式，但允许梯度传播（如果需要训练semantic_model）
+        self.semantic_model.eval()
+
+    def extract(
+        self,
+        waveforms: Sequence[torch.Tensor] | torch.Tensor,
+        sample_rates: Sequence[int] | int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(waveforms, torch.Tensor):
+            waveforms = [waveforms]
+        if isinstance(sample_rates, int):
+            sample_rates = [sample_rates]
+
+        arrays: List[np.ndarray] = []
+        for wav, sr in zip(waveforms, sample_rates):
+            current = wav
+            if sr != 16000:
+                current = torchaudio.functional.resample(current, sr, 16000)
+            arrays.append(current.squeeze(0).cpu().numpy())
+
+        inputs = self.feature_extractor(
+            arrays,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+        )
+        input_features = inputs["input_features"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        outputs = self.semantic_model(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        feat = outputs.hidden_states[17]
+        feat = (feat - self.semantic_mean) / self.semantic_std
+        return feat, attention_mask
+
+
+def extract_semantic_features_from_audio(
+    audio_path: Path,
+    semantic_extractor: SemanticExtractor,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    从原始音频提取语义特征
+    
+    Args:
+        audio_path: 音频文件路径
+        semantic_extractor: SemanticExtractor实例
+        device: 设备
+    
+    Returns:
+        feat: 提取的语义特征，形状 (1, seq_len, hidden_dim)
+        attention_mask: attention mask，形状 (1, seq_len)
+    """
+    # 加载音频
+    wav, sr = torchaudio.load(audio_path)
+    
+    # 提取特征（semantic_extractor.extract内部会处理重采样到16000Hz）
+    feat, attention_mask = semantic_extractor.extract(wav, sr)
+    
+    return feat, attention_mask
 
 
 def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -403,6 +516,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     languages = [item.get("language") for item in batch]
     prompt_languages = [item.get("prompt_language") for item in batch]
     manifest_paths = [item.get("manifest_path") for item in batch]
+    audio_paths = [item.get("audio_path", "") for item in batch]
 
     return {
         "ids": ids,
@@ -418,6 +532,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         "languages": languages,
         "prompt_languages": prompt_languages,
         "manifest_paths": manifest_paths,
+        "audio_paths": audio_paths,
     }
 
 
@@ -491,6 +606,9 @@ def compute_losses(
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
     ignore_pretrained_features: bool = False,
+    semantic_extractor: Optional[SemanticExtractor] = None,
+    audio_paths: Optional[List[str]] = None,
+    audio_roots: Optional[List[Path]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
     text_ids = batch["text_ids"].to(device)
     codes = batch["codes"].to(device)
@@ -502,14 +620,48 @@ def compute_losses(
 
     # 根据参数决定是否使用预提取的特征
     if ignore_pretrained_features:
-        # 使用零向量替代预提取的condition和emo_vec
-        # condition形状: (batch, 32, model_dim)
-        # emo_vec形状: (batch, model_dim)
-        cond_len = model.cond_num  # 通常是32
-        model_dim = model.model_dim
-
-        condition = torch.zeros(batch_size, cond_len, model_dim, device=device)
-        emo_vec = torch.zeros(batch_size, model_dim, device=device)
+        # 从原始音频动态提取特征
+        if semantic_extractor is None or audio_paths is None or audio_roots is None:
+            raise ValueError(
+                "When ignore_pretrained_features=True, semantic_extractor, audio_paths, and audio_roots must be provided."
+            )
+        
+        # 解析audio_paths（处理相对路径）
+        resolved_paths = []
+        for audio_path_str in audio_paths:
+            if not audio_path_str:
+                raise ValueError("Empty audio_path in batch")
+            resolved = resolve_audio_path(audio_path_str, audio_roots)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"Audio file not found: {audio_path_str} "
+                    f"(searched in {[str(r) for r in audio_roots]})"
+                )
+            resolved_paths.append(resolved)
+        
+        # 从音频提取语义特征
+        feats = []
+        attention_masks = []
+        for audio_path in resolved_paths:
+            feat, attn_mask = extract_semantic_features_from_audio(
+                audio_path, semantic_extractor, device
+            )
+            feats.append(feat)
+            attention_masks.append(attn_mask)
+        
+        # 合并batch
+        feat = torch.cat(feats, dim=0)  # (batch, seq_len, hidden_dim)
+        attention_mask = torch.cat(attention_masks, dim=0)  # (batch, seq_len)
+        
+        # 计算cond_lengths
+        cond_lengths = attention_mask.sum(dim=1).long()
+        
+        # 调用get_conditioning：需要 (batch, hidden_dim, seq_len) 格式
+        feat_t = feat.transpose(1, 2)  # (batch, seq_len, hidden_dim) -> (batch, hidden_dim, seq_len)
+        condition = model.get_conditioning(feat_t, cond_lengths)
+        
+        # 调用get_emovec：直接使用 (batch, seq_len, hidden_dim) 格式
+        emo_vec = model.get_emovec(feat, cond_lengths)
     else:
         # 使用预提取的特征（原始逻辑）
         condition = batch["condition"].to(device)
@@ -610,12 +762,15 @@ def evaluate(
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
     ignore_pretrained_features: bool = False,
+    semantic_extractor: Optional[SemanticExtractor] = None,
+    audio_roots: Optional[List[Path]] = None,
 ) -> Dict[str, float]:
     model.eval()
     totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
     count = 0
     with torch.no_grad():
         for batch in loader:
+            audio_paths = batch.get("audio_paths", [])
             text_loss, mel_loss, metrics = compute_losses(
                 model,
                 batch,
@@ -623,6 +778,9 @@ def evaluate(
                 use_duration_control=use_duration_control,
                 duration_dropout=duration_dropout,
                 ignore_pretrained_features=ignore_pretrained_features,
+                semantic_extractor=semantic_extractor,
+                audio_paths=audio_paths if ignore_pretrained_features else None,
+                audio_roots=audio_roots if ignore_pretrained_features else None,
             )
             bsz = batch["text_ids"].size(0)
             totals["text_loss"] += text_loss.item() * bsz
@@ -654,6 +812,30 @@ def main() -> None:
 
     tokenizer = load_tokenizer(args.tokenizer)
     model = build_model(args.config, tokenizer, args.base_checkpoint, device)
+
+    # 加载semantic_extractor（当ignore_pretrained_features=True时）
+    semantic_extractor = None
+    audio_roots = []
+    if args.ignore_pretrained_features:
+        cfg = OmegaConf.load(args.config)
+        stats_value = OmegaConf.select(cfg, "w2v_stat")
+        stats_path = Path(stats_value or "checkpoints/wav2vec2bert_stats.pt")
+        if not stats_path.is_absolute():
+            stats_path = (args.config.parent / stats_path).resolve()
+        semantic_extractor = SemanticExtractor(stats_path, device)
+        print(f"[Info] Loaded semantic_extractor from {stats_path}")
+        
+        # 解析audio_roots
+        if args.audio_roots:
+            for audio_root in args.audio_roots:
+                audio_root_path = Path(audio_root).expanduser().resolve()
+                if audio_root_path.exists() and audio_root_path.is_dir():
+                    audio_roots.append(audio_root_path)
+                    print(f"[Info] Added audio root: {audio_root_path}")
+                else:
+                    print(f"[Warn] Audio root does not exist or is not a directory: {audio_root_path}")
+        if not audio_roots:
+            print("[Warn] No valid audio roots provided. Audio path resolution may fail for relative paths.")
 
     train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
@@ -778,6 +960,7 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
             with torch.cuda.amp.autocast(enabled=use_amp):
+                audio_paths = batch.get("audio_paths", [])
                 text_loss, mel_loss, metrics = compute_losses(
                     model,
                     batch,
@@ -785,6 +968,9 @@ def main() -> None:
                     use_duration_control=args.use_duration_control,
                     duration_dropout=args.duration_dropout,
                     ignore_pretrained_features=args.ignore_pretrained_features,
+                    semantic_extractor=semantic_extractor,
+                    audio_paths=audio_paths if args.ignore_pretrained_features else None,
+                    audio_roots=audio_roots if args.ignore_pretrained_features else None,
                 )
                 loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
             if use_amp:
@@ -849,6 +1035,8 @@ def main() -> None:
                         use_duration_control=args.use_duration_control,
                         duration_dropout=args.duration_dropout,
                         ignore_pretrained_features=args.ignore_pretrained_features,
+                        semantic_extractor=semantic_extractor,
+                        audio_roots=audio_roots,
                     )
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
@@ -913,6 +1101,8 @@ def main() -> None:
                 use_duration_control=args.use_duration_control,
                 duration_dropout=args.duration_dropout,
                 ignore_pretrained_features=args.ignore_pretrained_features,
+                semantic_extractor=semantic_extractor,
+                audio_roots=audio_roots,
             )
             writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
             writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
