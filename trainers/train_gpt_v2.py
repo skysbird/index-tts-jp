@@ -41,7 +41,7 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.front import TextNormalizer, TextTokenizer
-from indextts.utils.maskgct_utils import build_semantic_model
+from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from transformers import SeamlessM4TFeatureExtractor
 import torchaudio
 
@@ -104,7 +104,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ignore-pretrained-features",
         action="store_true",
-        help="Ignore pre-extracted conditioning and emotion vectors, use zeros instead (useful when pretrained model language doesn't match training data).",
+        help="Ignore pre-extracted conditioning and emotion vectors. Use --use-codes-recovery to recover features from codes (lower memory) or audio extraction (higher memory).",
+    )
+    parser.add_argument(
+        "--use-codes-recovery",
+        action="store_true",
+        help="When --ignore-pretrained-features is enabled, recover features from codes instead of extracting from audio (much lower memory usage).",
     )
     parser.add_argument(
         "--audio-root",
@@ -491,6 +496,8 @@ class SemanticExtractor:
             if sr != 16000:
                 current = torchaudio.functional.resample(current, sr, 16000)
             arrays.append(current.squeeze(0).cpu().numpy())
+            # 释放原始音频内存
+            del current
 
         inputs = self.feature_extractor(
             arrays,
@@ -498,14 +505,25 @@ class SemanticExtractor:
             return_tensors="pt",
             padding=True,
         )
+        # 释放arrays内存
+        del arrays
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        
         input_features = inputs["input_features"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
+        # 释放inputs内存
+        del inputs
+        
         outputs = self.semantic_model(
             input_features=input_features,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
         feat = outputs.hidden_states[17]
+        # 释放outputs内存（只保留需要的hidden_states）
+        del outputs, input_features
+        
         feat = (feat - self.semantic_mean) / self.semantic_std
         return feat, attention_mask
 
@@ -618,6 +636,79 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Optio
     return model.to(device)
 
 
+def recover_features_from_codes(
+    codes: torch.Tensor,
+    code_lengths: torch.Tensor,
+    semantic_codec,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    从codes恢复语义特征
+    
+    Args:
+        codes: 量化codes，形状 (batch, max_seq_len)
+        code_lengths: 每个样本的实际长度，形状 (batch,)
+        semantic_codec: RepCodec模型
+        device: 设备
+    
+    Returns:
+        feat: 恢复的特征，形状 (batch, max_seq_len, hidden_dim)
+        attention_mask: attention mask，形状 (batch, max_seq_len)
+    """
+    batch_size, max_seq_len = codes.shape
+    hidden_dim = semantic_codec.hidden_size
+    
+    # 创建attention_mask
+    attention_mask = torch.arange(max_seq_len, device=device).unsqueeze(0) < code_lengths.unsqueeze(1)
+    attention_mask = attention_mask.long()
+    
+    # 从codes恢复特征：使用quantizer的vq2emb方法（如果可用）
+    # 或者通过codebook lookup
+    quantizer = semantic_codec.quantizer
+    
+    # 方法1: 尝试使用quantizer的vq2emb方法（如果可用）
+    if hasattr(quantizer, 'vq2emb'):
+        # codes需要转换为正确的格式
+        # vq2emb期望的格式可能是 (num_quantizers, batch, seq_len) 或 (batch, seq_len)
+        # 对于num_quantizers=1，codes是 (batch, seq_len)
+        if semantic_codec.num_quantizers == 1:
+            codes_for_vq = codes.unsqueeze(0)  # (1, batch, seq_len)
+        else:
+            codes_for_vq = codes  # 假设已经是正确的格式
+        feat = quantizer.vq2emb(codes_for_vq)  # (batch, hidden_dim, seq_len) 或 (batch, seq_len, hidden_dim)
+        # 转换为 (batch, seq_len, hidden_dim)
+        if feat.dim() == 3 and feat.shape[1] == hidden_dim:
+            feat = feat.transpose(1, 2)  # (batch, hidden_dim, seq_len) -> (batch, seq_len, hidden_dim)
+    elif hasattr(quantizer, 'quantizers') and len(quantizer.quantizers) > 0:
+        # 方法2: 从第一个quantizer的codebook lookup
+        first_quantizer = quantizer.quantizers[0]
+        if hasattr(first_quantizer, 'codebook'):
+            codebook = first_quantizer.codebook
+            # codes形状: (batch, seq_len)
+            codes_flat = codes.reshape(-1)  # (batch * seq_len,)
+            # 使用F.embedding lookup
+            feat_flat = F.embedding(codes_flat, codebook.weight)  # (batch * seq_len, codebook_dim)
+            # 恢复形状
+            feat = feat_flat.reshape(batch_size, max_seq_len, -1)  # (batch, seq_len, codebook_dim)
+            
+            # 如果codebook_dim != hidden_size，需要通过out_project
+            if feat.shape[-1] != hidden_dim:
+                if hasattr(first_quantizer, 'out_project'):
+                    # out_project期望 (batch, codebook_dim, seq_len)
+                    feat = first_quantizer.out_project(feat.transpose(1, 2)).transpose(1, 2)  # (batch, seq_len, hidden_dim)
+                else:
+                    raise NotImplementedError(
+                        f"Codebook dim ({feat.shape[-1]}) != hidden dim ({hidden_dim}) "
+                        "and no out_project found."
+                    )
+        else:
+            raise NotImplementedError("Quantizer codebook not found.")
+    else:
+        raise NotImplementedError("Unsupported quantizer type for code recovery.")
+    
+    return feat, attention_mask
+
+
 def compute_losses(
     model: UnifiedVoice,
     batch: Dict[str, torch.Tensor],
@@ -625,7 +716,9 @@ def compute_losses(
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
     ignore_pretrained_features: bool = False,
+    use_codes_recovery: bool = False,
     semantic_extractor: Optional[SemanticExtractor] = None,
+    semantic_codec = None,
     audio_paths: Optional[List[str]] = None,
     audio_roots: Optional[List[Path]] = None,
     prompt_audio_paths: Optional[List[str]] = None,
@@ -641,11 +734,107 @@ def compute_losses(
 
     # 根据参数决定是否使用预提取的特征
     if ignore_pretrained_features:
-        # 从原始音频动态提取特征
-        if semantic_extractor is None or audio_roots is None:
-            raise ValueError(
-                "When ignore_pretrained_features=True, semantic_extractor and audio_roots must be provided."
-            )
+        if use_codes_recovery:
+            # 从codes恢复特征（内存占用低）
+            if semantic_codec is None:
+                raise ValueError(
+                    "When use_codes_recovery=True, semantic_codec must be provided."
+                )
+            
+            # 判断是paired还是single manifest
+            is_paired = (prompt_audio_paths is not None and 
+                         len(prompt_audio_paths) > 0 and 
+                         prompt_audio_paths[0] and 
+                         prompt_audio_paths[0].strip())
+            
+            if is_paired:
+                # Paired manifest: 
+                # - conditioning需要prompt的codes，但manifest中没有，所以仍然需要从音频提取或使用预提取的conditioning
+                # - emo_vec可以从target的codes恢复（如果emo_vec来自target）
+                # 为了简化，这里对于paired模式，conditioning仍然从音频提取，emo_vec从codes恢复
+                # TODO: 如果manifest中有prompt_codes_path，可以从prompt codes恢复conditioning
+                
+                # 对于conditioning，暂时使用预提取的（如果可用）或从音频提取
+                # 这里我们使用预提取的conditioning（如果batch中有）
+                if "condition" in batch and batch["condition"].numel() > 0:
+                    condition = batch["condition"].to(device)
+                    cond_lengths = batch["condition_lengths"].to(device)
+                else:
+                    # 如果没有预提取的conditioning，需要从音频提取
+                    if semantic_extractor is None or audio_roots is None:
+                        raise ValueError(
+                            "For paired manifest with codes recovery, either pre-extracted conditioning "
+                            "or semantic_extractor+audio_roots must be provided for prompt conditioning."
+                        )
+                    # 从prompt音频提取conditioning
+                    prompt_resolved_paths = []
+                    for idx, audio_path_str in enumerate(prompt_audio_paths):
+                        if not audio_path_str:
+                            raise ValueError(f"Empty prompt_audio_path in batch at index {idx}")
+                        resolved = resolve_audio_path(audio_path_str, audio_roots)
+                        if resolved is None:
+                            raise FileNotFoundError(
+                                f"Prompt audio file not found: {audio_path_str} "
+                                f"(searched in {[str(r) for r in audio_roots]})"
+                            )
+                        prompt_resolved_paths.append(resolved)
+                    
+                    prompt_waveforms = []
+                    prompt_sample_rates = []
+                    for audio_path in prompt_resolved_paths:
+                        wav, sr = torchaudio.load(audio_path)
+                        prompt_waveforms.append(wav)
+                        prompt_sample_rates.append(sr)
+                    
+                    prompt_feat, prompt_attention_mask = semantic_extractor.extract(
+                        prompt_waveforms, prompt_sample_rates
+                    )
+                    del prompt_waveforms, prompt_sample_rates
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    
+                    prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
+                    prompt_feat_t = prompt_feat.transpose(1, 2)
+                    condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+                    cond_lengths = prompt_cond_lengths
+                    del prompt_feat, prompt_feat_t, prompt_attention_mask
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                
+                # 对于emo_vec，从target的codes恢复
+                feat, attention_mask = recover_features_from_codes(
+                    codes, code_lengths, semantic_codec, device
+                )
+                emo_cond_lengths = attention_mask.sum(dim=1).long()
+                emo_vec = model.get_emovec(feat, emo_cond_lengths)
+                del feat, attention_mask
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            else:
+                # Single manifest: 从codes恢复特征
+                feat, attention_mask = recover_features_from_codes(
+                    codes, code_lengths, semantic_codec, device
+                )
+                cond_lengths = attention_mask.sum(dim=1).long()
+                
+                # 调用get_conditioning：需要 (batch, hidden_dim, seq_len) 格式
+                feat_t = feat.transpose(1, 2)  # (batch, seq_len, hidden_dim) -> (batch, hidden_dim, seq_len)
+                condition = model.get_conditioning(feat_t, cond_lengths)
+                
+                # 调用get_emovec：直接使用 (batch, seq_len, hidden_dim) 格式
+                emo_vec = model.get_emovec(feat, cond_lengths)
+                
+                # 释放内存
+                del feat, feat_t, attention_mask
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+        else:
+            # 从原始音频动态提取特征（内存占用高）
+            if semantic_extractor is None or audio_roots is None:
+                raise ValueError(
+                    "When ignore_pretrained_features=True and use_codes_recovery=False, "
+                    "semantic_extractor and audio_roots must be provided."
+                )
         
         # 判断是paired还是single manifest
         # 如果prompt_audio_paths存在且第一个元素不为空，说明是paired manifest
@@ -696,6 +885,23 @@ def compute_losses(
                 prompt_waveforms, prompt_sample_rates
             )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
             
+            # 释放音频数据内存
+            del prompt_waveforms, prompt_sample_rates
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            
+            # 计算cond_lengths
+            prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
+            
+            # 调用get_conditioning：需要 (batch, hidden_dim, seq_len) 格式
+            prompt_feat_t = prompt_feat.transpose(1, 2)  # (batch, seq_len, hidden_dim) -> (batch, hidden_dim, seq_len)
+            condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+            
+            # 释放prompt_feat内存（condition已经提取完成）
+            del prompt_feat, prompt_feat_t, prompt_attention_mask
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            
             # 加载所有emo音频
             emo_waveforms = []
             emo_sample_rates = []
@@ -709,16 +915,21 @@ def compute_losses(
                 emo_waveforms, emo_sample_rates
             )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
             
-            # 计算cond_lengths
-            prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
-            emo_cond_lengths = emo_attention_mask.sum(dim=1).long()
+            # 释放音频数据内存
+            del emo_waveforms, emo_sample_rates
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             
-            # 调用get_conditioning：需要 (batch, hidden_dim, seq_len) 格式
-            prompt_feat_t = prompt_feat.transpose(1, 2)  # (batch, seq_len, hidden_dim) -> (batch, hidden_dim, seq_len)
-            condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+            # 计算cond_lengths
+            emo_cond_lengths = emo_attention_mask.sum(dim=1).long()
             
             # 调用get_emovec：直接使用 (batch, seq_len, hidden_dim) 格式
             emo_vec = model.get_emovec(emo_feat, emo_cond_lengths)
+            
+            # 释放emo_feat内存（emo_vec已经提取完成）
+            del emo_feat, emo_attention_mask
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         else:
             # Single manifest: 使用同一个audio_paths提取conditioning和emo_vec
             if audio_paths is None:
@@ -749,6 +960,11 @@ def compute_losses(
                 waveforms, sample_rates
             )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
             
+            # 释放音频数据内存
+            del waveforms, sample_rates
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            
             # 计算cond_lengths
             cond_lengths = attention_mask.sum(dim=1).long()
             
@@ -758,6 +974,11 @@ def compute_losses(
             
             # 调用get_emovec：直接使用 (batch, seq_len, hidden_dim) 格式
             emo_vec = model.get_emovec(feat, cond_lengths)
+            
+            # 释放feat内存（condition和emo_vec已经提取完成）
+            del feat, feat_t, attention_mask
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     else:
         # 使用预提取的特征（原始逻辑）
         condition = batch["condition"].to(device)
@@ -858,7 +1079,9 @@ def evaluate(
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
     ignore_pretrained_features: bool = False,
+    use_codes_recovery: bool = False,
     semantic_extractor: Optional[SemanticExtractor] = None,
+    semantic_codec = None,
     audio_roots: Optional[List[Path]] = None,
     prompt_audio_paths: Optional[List[str]] = None,
     target_audio_paths: Optional[List[str]] = None,
@@ -878,7 +1101,9 @@ def evaluate(
                 use_duration_control=use_duration_control,
                 duration_dropout=duration_dropout,
                 ignore_pretrained_features=ignore_pretrained_features,
+                use_codes_recovery=use_codes_recovery,
                 semantic_extractor=semantic_extractor,
+                semantic_codec=semantic_codec,
                 audio_paths=audio_paths if ignore_pretrained_features else None,
                 audio_roots=audio_roots if ignore_pretrained_features else None,
                 prompt_audio_paths=prompt_audio_paths_batch if ignore_pretrained_features else None,
@@ -915,29 +1140,40 @@ def main() -> None:
     tokenizer = load_tokenizer(args.tokenizer)
     model = build_model(args.config, tokenizer, args.base_checkpoint, device)
 
-    # 加载semantic_extractor（当ignore_pretrained_features=True时）
+    # 加载semantic_extractor和semantic_codec（当ignore_pretrained_features=True时）
     semantic_extractor = None
+    semantic_codec = None
     audio_roots = []
     if args.ignore_pretrained_features:
         cfg = OmegaConf.load(args.config)
-        stats_value = OmegaConf.select(cfg, "w2v_stat")
-        stats_path = Path(stats_value or "checkpoints/wav2vec2bert_stats.pt")
-        if not stats_path.is_absolute():
-            stats_path = (args.config.parent / stats_path).resolve()
-        semantic_extractor = SemanticExtractor(stats_path, device)
-        print(f"[Info] Loaded semantic_extractor from {stats_path}")
         
-        # 解析audio_roots
-        if args.audio_roots:
-            for audio_root in args.audio_roots:
-                audio_root_path = Path(audio_root).expanduser().resolve()
-                if audio_root_path.exists() and audio_root_path.is_dir():
-                    audio_roots.append(audio_root_path)
-                    print(f"[Info] Added audio root: {audio_root_path}")
-                else:
-                    print(f"[Warn] Audio root does not exist or is not a directory: {audio_root_path}")
-        if not audio_roots:
-            print("[Warn] No valid audio roots provided. Audio path resolution may fail for relative paths.")
+        if args.use_codes_recovery:
+            # 加载semantic_codec用于从codes恢复特征
+            semantic_codec = build_semantic_codec(cfg.semantic_codec)
+            semantic_codec = semantic_codec.to(device)
+            semantic_codec.eval()
+            print(f"[Info] Loaded semantic_codec for codes recovery (low memory mode)")
+        else:
+            # 加载semantic_extractor用于从音频提取特征
+            stats_value = OmegaConf.select(cfg, "w2v_stat")
+            stats_path = Path(stats_value or "checkpoints/wav2vec2bert_stats.pt")
+            if not stats_path.is_absolute():
+                stats_path = (args.config.parent / stats_path).resolve()
+            semantic_extractor = SemanticExtractor(stats_path, device)
+            print(f"[Info] Loaded semantic_extractor from {stats_path} (high memory mode)")
+        
+        # 解析audio_roots（对于paired模式或非codes_recovery模式需要）
+        if not args.use_codes_recovery or args.ignore_pretrained_features:
+            if args.audio_roots:
+                for audio_root in args.audio_roots:
+                    audio_root_path = Path(audio_root).expanduser().resolve()
+                    if audio_root_path.exists() and audio_root_path.is_dir():
+                        audio_roots.append(audio_root_path)
+                        print(f"[Info] Added audio root: {audio_root_path}")
+                    else:
+                        print(f"[Warn] Audio root does not exist or is not a directory: {audio_root_path}")
+            if not audio_roots and not args.use_codes_recovery:
+                print("[Warn] No valid audio roots provided. Audio path resolution may fail for relative paths.")
 
     train_specs = parse_manifest_specs(args.train_manifests, "--train-manifest")
     val_specs = parse_manifest_specs(args.val_manifests, "--val-manifest")
@@ -1072,7 +1308,9 @@ def main() -> None:
                     use_duration_control=args.use_duration_control,
                     duration_dropout=args.duration_dropout,
                     ignore_pretrained_features=args.ignore_pretrained_features,
+                    use_codes_recovery=args.use_codes_recovery,
                     semantic_extractor=semantic_extractor,
+                    semantic_codec=semantic_codec,
                     audio_paths=audio_paths if args.ignore_pretrained_features else None,
                     audio_roots=audio_roots if args.ignore_pretrained_features else None,
                     prompt_audio_paths=prompt_audio_paths if args.ignore_pretrained_features else None,
@@ -1141,7 +1379,9 @@ def main() -> None:
                         use_duration_control=args.use_duration_control,
                         duration_dropout=args.duration_dropout,
                         ignore_pretrained_features=args.ignore_pretrained_features,
+                        use_codes_recovery=args.use_codes_recovery,
                         semantic_extractor=semantic_extractor,
+                        semantic_codec=semantic_codec,
                         audio_roots=audio_roots,
                     )
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
@@ -1207,7 +1447,9 @@ def main() -> None:
                 use_duration_control=args.use_duration_control,
                 duration_dropout=args.duration_dropout,
                 ignore_pretrained_features=args.ignore_pretrained_features,
+                use_codes_recovery=args.use_codes_recovery,
                 semantic_extractor=semantic_extractor,
+                semantic_codec=semantic_codec,
                 audio_roots=audio_roots,
             )
             writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
