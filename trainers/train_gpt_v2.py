@@ -731,15 +731,21 @@ def main() -> None:
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        if checkpoint.get("scheduler"):
-            scheduler.load_state_dict(checkpoint["scheduler"])
+        # 不加载 scheduler 状态，使用新的学习率重新开始
+        # 这样可以在 resume 时通过 --learning-rate 参数调整学习率
+        # if checkpoint.get("scheduler"):
+        #     scheduler.load_state_dict(checkpoint["scheduler"])
         if scaler and checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("step", 0)
         recent_checkpoints = checkpoint.get("recent_checkpoints", [])
         last_saved_step = checkpoint.get("step")
+        # 手动设置 optimizer 的学习率为新的值
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = args.learning_rate
         print(f"[Info] Resumed from {resume_path} at epoch {start_epoch}, step {global_step}.")
+        print(f"[Info] Learning rate reset to: {args.learning_rate} (scheduler will restart from this LR).")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
