@@ -92,6 +92,11 @@ def parse_args() -> argparse.Namespace:
         help="Probability of zeroing duration embeddings when --use-duration-control is enabled.",
     )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    parser.add_argument(
+        "--ignore-pretrained-features",
+        action="store_true",
+        help="Ignore pre-extracted conditioning and emotion vectors, use zeros instead (useful when pretrained model language doesn't match training data).",
+    )
     return parser.parse_args()
 
 
@@ -470,16 +475,30 @@ def compute_losses(
     device: torch.device,
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
+    ignore_pretrained_features: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-    condition = batch["condition"].to(device)
     text_ids = batch["text_ids"].to(device)
     codes = batch["codes"].to(device)
-    emo_vec = batch["emo_vec"].to(device)
     text_lengths = batch["text_lengths"].to(device)
     code_lengths = batch["code_lengths"].to(device)
 
     batch_size = text_ids.size(0)
     use_speed = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    # 根据参数决定是否使用预提取的特征
+    if ignore_pretrained_features:
+        # 使用零向量替代预提取的condition和emo_vec
+        # condition形状: (batch, 32, model_dim)
+        # emo_vec形状: (batch, model_dim)
+        cond_len = model.cond_num  # 通常是32
+        model_dim = model.model_dim
+
+        condition = torch.zeros(batch_size, cond_len, model_dim, device=device)
+        emo_vec = torch.zeros(batch_size, model_dim, device=device)
+    else:
+        # 使用预提取的特征（原始逻辑）
+        condition = batch["condition"].to(device)
+        emo_vec = batch["emo_vec"].to(device)
 
     text_inputs = model.set_text_padding(text_ids.clone(), text_lengths)
     text_inputs = F.pad(text_inputs, (0, 1), value=model.stop_text_token)
@@ -575,6 +594,7 @@ def evaluate(
     device: torch.device,
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
+    ignore_pretrained_features: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
@@ -587,6 +607,7 @@ def evaluate(
                 device,
                 use_duration_control=use_duration_control,
                 duration_dropout=duration_dropout,
+                ignore_pretrained_features=ignore_pretrained_features,
             )
             bsz = batch["text_ids"].size(0)
             totals["text_loss"] += text_loss.item() * bsz
@@ -726,6 +747,7 @@ def main() -> None:
                     device,
                     use_duration_control=args.use_duration_control,
                     duration_dropout=args.duration_dropout,
+                    ignore_pretrained_features=args.ignore_pretrained_features,
                 )
                 loss = args.text_loss_weight * text_loss + args.mel_loss_weight * mel_loss
             if use_amp:
@@ -766,6 +788,7 @@ def main() -> None:
                         device,
                         use_duration_control=args.use_duration_control,
                         duration_dropout=args.duration_dropout,
+                        ignore_pretrained_features=args.ignore_pretrained_features,
                     )
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
@@ -829,6 +852,7 @@ def main() -> None:
                 device,
                 use_duration_control=args.use_duration_control,
                 duration_dropout=args.duration_dropout,
+                ignore_pretrained_features=args.ignore_pretrained_features,
             )
             writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
             writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
