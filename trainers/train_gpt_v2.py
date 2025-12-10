@@ -510,32 +510,6 @@ class SemanticExtractor:
         return feat, attention_mask
 
 
-def extract_semantic_features_from_audio(
-    audio_path: Path,
-    semantic_extractor: SemanticExtractor,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    从原始音频提取语义特征
-    
-    Args:
-        audio_path: 音频文件路径
-        semantic_extractor: SemanticExtractor实例
-        device: 设备
-    
-    Returns:
-        feat: 提取的语义特征，形状 (1, seq_len, hidden_dim)
-        attention_mask: attention mask，形状 (1, seq_len)
-    """
-    # 加载音频
-    wav, sr = torchaudio.load(audio_path)
-    
-    # 提取特征（semantic_extractor.extract内部会处理重采样到16000Hz）
-    feat, attention_mask = semantic_extractor.extract(wav, sr)
-    
-    return feat, attention_mask
-
-
 def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     text_tensors = [item["text_ids"] for item in batch]
     code_tensors = [item["codes"] for item in batch]
@@ -709,31 +683,31 @@ def compute_losses(
                     )
                 emo_resolved_paths.append(resolved)
             
-            # 从prompt音频提取conditioning特征
-            prompt_feats = []
-            prompt_attention_masks = []
+            # 加载所有prompt音频（参照preprocess_data.py第376-397行）
+            prompt_waveforms = []
+            prompt_sample_rates = []
             for audio_path in prompt_resolved_paths:
-                feat, attn_mask = extract_semantic_features_from_audio(
-                    audio_path, semantic_extractor, device
-                )
-                prompt_feats.append(feat)
-                prompt_attention_masks.append(attn_mask)
+                wav, sr = torchaudio.load(audio_path)
+                prompt_waveforms.append(wav)
+                prompt_sample_rates.append(sr)
             
-            # 从emo音频提取emo_vec特征
-            emo_feats = []
-            emo_attention_masks = []
+            # 一次性提取整个batch的特征（会自动padding，参照preprocess_data.py第405行）
+            prompt_feat, prompt_attention_mask = semantic_extractor.extract(
+                prompt_waveforms, prompt_sample_rates
+            )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
+            
+            # 加载所有emo音频
+            emo_waveforms = []
+            emo_sample_rates = []
             for audio_path in emo_resolved_paths:
-                feat, attn_mask = extract_semantic_features_from_audio(
-                    audio_path, semantic_extractor, device
-                )
-                emo_feats.append(feat)
-                emo_attention_masks.append(attn_mask)
+                wav, sr = torchaudio.load(audio_path)
+                emo_waveforms.append(wav)
+                emo_sample_rates.append(sr)
             
-            # 合并batch
-            prompt_feat = torch.cat(prompt_feats, dim=0)  # (batch, seq_len, hidden_dim)
-            prompt_attention_mask = torch.cat(prompt_attention_masks, dim=0)  # (batch, seq_len)
-            emo_feat = torch.cat(emo_feats, dim=0)  # (batch, seq_len, hidden_dim)
-            emo_attention_mask = torch.cat(emo_attention_masks, dim=0)  # (batch, seq_len)
+            # 一次性提取整个batch的特征（会自动padding）
+            emo_feat, emo_attention_mask = semantic_extractor.extract(
+                emo_waveforms, emo_sample_rates
+            )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
             
             # 计算cond_lengths
             prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
@@ -762,19 +736,18 @@ def compute_losses(
                     )
                 resolved_paths.append(resolved)
             
-            # 从音频提取语义特征
-            feats = []
-            attention_masks = []
+            # 加载所有音频（参照preprocess_data.py第376-397行）
+            waveforms = []
+            sample_rates = []
             for audio_path in resolved_paths:
-                feat, attn_mask = extract_semantic_features_from_audio(
-                    audio_path, semantic_extractor, device
-                )
-                feats.append(feat)
-                attention_masks.append(attn_mask)
+                wav, sr = torchaudio.load(audio_path)
+                waveforms.append(wav)
+                sample_rates.append(sr)
             
-            # 合并batch
-            feat = torch.cat(feats, dim=0)  # (batch, seq_len, hidden_dim)
-            attention_mask = torch.cat(attention_masks, dim=0)  # (batch, seq_len)
+            # 一次性提取整个batch的特征（会自动padding，参照preprocess_data.py第405行）
+            feat, attention_mask = semantic_extractor.extract(
+                waveforms, sample_rates
+            )  # (batch, max_seq_len, hidden_dim), (batch, max_seq_len)
             
             # 计算cond_lengths
             cond_lengths = attention_mask.sum(dim=1).long()
