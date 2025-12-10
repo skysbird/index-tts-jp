@@ -381,6 +381,10 @@ class JapaneseGPTDataset(Dataset):
                 condition = condition.astype(np.float32, copy=False)
                 emo_vec = emo_vec.astype(np.float32, copy=False)
 
+                audio_path_value = sample.audio_path if sample.audio_path else ""
+                if not audio_path_value:
+                    print(f"[Warn] Sample {sample.id} has no audio_path in manifest")
+
                 return {
                     "id": sample.id,
                     "text_ids": torch.from_numpy(text_ids),
@@ -395,7 +399,7 @@ class JapaneseGPTDataset(Dataset):
                     "language": sample.language,
                     "prompt_language": sample.prompt_language,
                     "manifest_path": str(sample.manifest_path) if sample.manifest_path else "",
-                    "audio_path": sample.audio_path if sample.audio_path else "",
+                    "audio_path": audio_path_value,
                 }
 
             except (FileNotFoundError, OSError, ValueError) as exc:
@@ -627,10 +631,18 @@ def compute_losses(
             )
         
         # 解析audio_paths（处理相对路径）
+        print(f"[Debug] audio_paths in batch: {audio_paths}")
+        print(f"[Debug] audio_paths type: {type(audio_paths)}")
+        print(f"[Debug] audio_paths length: {len(audio_paths) if audio_paths else 0}")
+        if audio_paths:
+            print(f"[Debug] First audio_path: {audio_paths[0]}, type: {type(audio_paths[0])}")
+        
         resolved_paths = []
-        for audio_path_str in audio_paths:
+        for idx, audio_path_str in enumerate(audio_paths):
+            print(f"[Debug] Processing audio_path[{idx}]: {audio_path_str}, type: {type(audio_path_str)}")
             if not audio_path_str:
-                raise ValueError("Empty audio_path in batch")
+                print(f"[Debug] Empty audio_path at index {idx}")
+                raise ValueError(f"Empty audio_path in batch at index {idx}. audio_paths: {audio_paths}")
             resolved = resolve_audio_path(audio_path_str, audio_roots)
             if resolved is None:
                 raise FileNotFoundError(
