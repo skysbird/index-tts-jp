@@ -770,10 +770,17 @@ def main() -> None:
                 (loss / args.grad_accumulation).backward()
 
             if (batch_idx + 1) % args.grad_accumulation == 0:
+                # 梯度裁剪和监控
+                grad_norm = None
                 if args.grad_clip > 0:
                     if use_amp:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    # 计算梯度范数（用于监控）
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                else:
+                    # 即使不裁剪，也计算梯度范数用于监控
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
@@ -789,11 +796,16 @@ def main() -> None:
                     writer.add_scalar("train/mel_loss", mel_loss.item(), global_step)
                     writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
-                    print(
+                    if grad_norm is not None:
+                        writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
+                    log_msg = (
                         f"[Train] epoch={epoch + 1} step={global_step} "
                         f"text_loss={text_loss.item():.4f} mel_loss={mel_loss.item():.4f} "
                         f"mel_top1={metrics['mel_top1']:.4f} lr={scheduler.get_last_lr()[0]:.2e}"
                     )
+                    if grad_norm is not None:
+                        log_msg += f" grad_norm={grad_norm.item():.2f}"
+                    print(log_msg)
 
                 if args.val_interval > 0 and global_step > 0 and global_step % args.val_interval == 0:
                     val_metrics = evaluate(
