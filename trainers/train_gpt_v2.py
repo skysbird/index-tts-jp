@@ -582,10 +582,12 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     prompt_codes_tensors = [item.get("prompt_codes") for item in batch if "prompt_codes" in item]
     prompt_code_lengths = None
     prompt_codes_padded = None
-    if prompt_codes_tensors and all(t is not None for t in prompt_codes_tensors):
+    if prompt_codes_tensors and all(t is not None for t in prompt_codes_tensors) and len(prompt_codes_tensors) == len(batch):
         # 如果所有样本都有prompt_codes，则pad并添加到batch
         prompt_codes_padded = pad_sequence(prompt_codes_tensors, batch_first=True, padding_value=0)
-        prompt_code_lengths = torch.stack([item["prompt_code_len"] for item in batch if "prompt_code_len" in item])
+        prompt_code_lengths_list = [item.get("prompt_code_len", 0) for item in batch if "prompt_code_len" in item]
+        if prompt_code_lengths_list and len(prompt_code_lengths_list) == len(batch):
+            prompt_code_lengths = torch.stack(prompt_code_lengths_list)
 
     result = {
         "ids": ids,
@@ -605,6 +607,13 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         "prompt_audio_paths": prompt_audio_paths,  # 用于conditioning（paired）
         "target_audio_paths": target_audio_paths,  # 用于emo_vec（paired，如果emo_vec来自target）
     }
+    
+    # 添加prompt_codes（如果可用）
+    if prompt_codes_padded is not None:
+        result["prompt_codes"] = prompt_codes_padded
+        result["prompt_code_lengths"] = prompt_code_lengths
+    
+    return result
 
 
 def load_tokenizer(tokenizer_path: Path) -> TextTokenizer:
