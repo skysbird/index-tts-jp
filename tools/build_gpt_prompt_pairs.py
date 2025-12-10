@@ -158,6 +158,8 @@ def build_pairs(
                     "speaker": speaker,
                     "prompt_id": prompt.id,
                     "prompt_audio_path": prompt.record.get("audio_path", ""),
+                    "prompt_codes_path": prompt.record.get("codes_path", ""),
+                    "prompt_code_len": int(prompt.record.get("code_len", 0)),
                     "prompt_condition_path": prompt.record["condition_path"],
                     "prompt_condition_len": int(prompt.record.get("condition_len", 0)),
                     "prompt_emo_vec_path": prompt.record.get("emo_vec_path", ""),

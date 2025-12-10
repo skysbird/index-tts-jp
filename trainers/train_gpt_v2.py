@@ -194,6 +194,8 @@ class Sample:
     audio_path: Optional[str] = None  # 用于single manifest或作为fallback
     prompt_audio_path: Optional[str] = None  # 用于paired manifest的conditioning
     target_audio_path: Optional[str] = None  # 用于paired manifest的emo_vec
+    prompt_codes_path: Optional[Path] = None  # 用于paired manifest的prompt codes（codes recovery模式）
+    prompt_code_len: Optional[int] = None  # prompt codes的长度
 
 
 class JapaneseGPTDataset(Dataset):
@@ -304,6 +306,8 @@ class JapaneseGPTDataset(Dataset):
                         prompt_audio_path=prompt_audio_path_value,
                         target_audio_path=target_audio_path_value,
                         audio_path=emo_audio_path,  # 用于emo_vec的音频路径
+                        prompt_codes_path=self._resolve_path(base_dir, record.get("prompt_codes_path", "")) if record.get("prompt_codes_path") else None,
+                        prompt_code_len=int(record.get("prompt_code_len", 0)) if record.get("prompt_code_len") else None,
                     )
                 else:
                     language = self._normalize_language(record.get("language") or spec.language)
@@ -411,6 +415,20 @@ class JapaneseGPTDataset(Dataset):
                 condition = condition.astype(np.float32, copy=False)
                 emo_vec = emo_vec.astype(np.float32, copy=False)
 
+                # 对于paired manifest，加载prompt codes（如果可用）
+                prompt_codes = None
+                prompt_code_len_value = None
+                if sample.sample_type == "paired" and sample.prompt_codes_path and sample.prompt_codes_path.exists():
+                    try:
+                        prompt_codes = np.load(sample.prompt_codes_path, allow_pickle=False)
+                        if prompt_codes.size > 0:
+                            prompt_codes = prompt_codes.astype(np.int64, copy=False)
+                            prompt_code_len_value = sample.prompt_code_len if sample.prompt_code_len else len(prompt_codes)
+                    except (FileNotFoundError, OSError, ValueError) as exc:
+                        # prompt codes加载失败，使用None（将回退到音频提取）
+                        prompt_codes = None
+                        prompt_code_len_value = None
+
                 # 对于paired manifest，需要两套音频路径
                 prompt_audio_path_value = sample.prompt_audio_path if sample.prompt_audio_path else ""
                 target_audio_path_value = sample.target_audio_path if sample.target_audio_path else ""
@@ -425,7 +443,7 @@ class JapaneseGPTDataset(Dataset):
                     if not audio_path_value:
                         print(f"[Warn] Sample {sample.id} has no audio_path in manifest")
 
-                return {
+                result = {
                     "id": sample.id,
                     "text_ids": torch.from_numpy(text_ids),
                     "codes": torch.from_numpy(codes),
@@ -443,6 +461,13 @@ class JapaneseGPTDataset(Dataset):
                     "prompt_audio_path": prompt_audio_path_value,  # 用于conditioning（paired manifest）
                     "target_audio_path": target_audio_path_value,  # 用于emo_vec（paired manifest，如果emo_vec来自target）
                 }
+                
+                # 添加prompt_codes（如果可用）
+                if prompt_codes is not None:
+                    result["prompt_codes"] = torch.from_numpy(prompt_codes)
+                    result["prompt_code_len"] = torch.tensor(prompt_code_len_value, dtype=torch.long)
+                
+                return result
 
             except (FileNotFoundError, OSError, ValueError) as exc:
                 if current_idx not in self.bad_indices:
@@ -552,8 +577,17 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
     audio_paths = [item.get("audio_path", "") for item in batch]
     prompt_audio_paths = [item.get("prompt_audio_path", "") for item in batch]
     target_audio_paths = [item.get("target_audio_path", "") for item in batch]
+    
+    # 收集prompt_codes（如果可用）
+    prompt_codes_tensors = [item.get("prompt_codes") for item in batch if "prompt_codes" in item]
+    prompt_code_lengths = None
+    prompt_codes_padded = None
+    if prompt_codes_tensors and all(t is not None for t in prompt_codes_tensors):
+        # 如果所有样本都有prompt_codes，则pad并添加到batch
+        prompt_codes_padded = pad_sequence(prompt_codes_tensors, batch_first=True, padding_value=0)
+        prompt_code_lengths = torch.stack([item["prompt_code_len"] for item in batch if "prompt_code_len" in item])
 
-    return {
+    result = {
         "ids": ids,
         "prompt_ids": prompt_ids,
         "target_ids": target_ids,
@@ -749,22 +783,35 @@ def compute_losses(
             
             if is_paired:
                 # Paired manifest: 
-                # - conditioning需要prompt的codes，但manifest中没有，所以仍然需要从音频提取或使用预提取的conditioning
-                # - emo_vec可以从target的codes恢复（如果emo_vec来自target）
-                # 为了简化，这里对于paired模式，conditioning仍然从音频提取，emo_vec从codes恢复
-                # TODO: 如果manifest中有prompt_codes_path，可以从prompt codes恢复conditioning
+                # - conditioning从prompt的codes恢复（如果可用）或从音频提取
+                # - emo_vec从target的codes恢复
                 
-                # 对于conditioning，暂时使用预提取的（如果可用）或从音频提取
-                # 这里我们使用预提取的conditioning（如果batch中有）
-                if "condition" in batch and batch["condition"].numel() > 0:
+                # 对于conditioning，优先使用prompt_codes恢复
+                if "prompt_codes" in batch and batch["prompt_codes"] is not None:
+                    # 从prompt codes恢复conditioning特征
+                    prompt_codes_batch = batch["prompt_codes"].to(device)
+                    prompt_code_lengths_batch = batch["prompt_code_lengths"].to(device)
+                    prompt_feat, prompt_attention_mask = recover_features_from_codes(
+                        prompt_codes_batch, prompt_code_lengths_batch, semantic_codec, device
+                    )
+                    prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
+                    prompt_feat_t = prompt_feat.transpose(1, 2)
+                    condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+                    cond_lengths = prompt_cond_lengths
+                    del prompt_feat, prompt_feat_t, prompt_attention_mask
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                elif "condition" in batch and batch["condition"].numel() > 0:
+                    # 使用预提取的conditioning
                     condition = batch["condition"].to(device)
                     cond_lengths = batch["condition_lengths"].to(device)
                 else:
-                    # 如果没有预提取的conditioning，需要从音频提取
+                    # 如果没有prompt_codes和预提取的conditioning，从音频提取
                     if semantic_extractor is None or audio_roots is None:
                         raise ValueError(
-                            "For paired manifest with codes recovery, either pre-extracted conditioning "
-                            "or semantic_extractor+audio_roots must be provided for prompt conditioning."
+                            "For paired manifest with codes recovery, either prompt_codes, "
+                            "pre-extracted conditioning, or semantic_extractor+audio_roots "
+                            "must be provided for prompt conditioning."
                         )
                     # 从prompt音频提取conditioning
                     prompt_resolved_paths = []
