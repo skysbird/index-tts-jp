@@ -63,7 +63,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tokenizer", type=Path, required=True, help="SentencePiece model path.")
     parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"), help="Model config YAML.")
-    parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/gpt.pth"), help="Base GPT checkpoint.")
+    parser.add_argument(
+        "--base-checkpoint",
+        type=Path,
+        default=None,
+        help="Base GPT checkpoint (optional, omit for training from scratch).",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts"), help="Directory for checkpoints/logs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Mini-batch size per optimisation step.")
     parser.add_argument("--grad-accumulation", type=int, default=1, help="Gradient accumulation steps.")
@@ -421,50 +426,59 @@ def load_tokenizer(tokenizer_path: Path) -> TextTokenizer:
     return tokenizer
 
 
-def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Path, device: torch.device) -> UnifiedVoice:
+def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Optional[Path], device: torch.device) -> UnifiedVoice:
     cfg = OmegaConf.load(cfg_path)
     vocab_size = tokenizer.vocab_size
     if cfg.gpt.number_text_tokens != vocab_size:
         cfg.gpt.number_text_tokens = vocab_size
 
     model = UnifiedVoice(**cfg.gpt)
-    checkpoint = torch.load(base_checkpoint, map_location="cpu")
-    raw_state_dict = checkpoint.get("model", checkpoint)
+    
+    # 只有在提供了checkpoint时才加载权重
+    if base_checkpoint is not None and base_checkpoint.exists():
+        print(f"[Info] Loading base checkpoint from {base_checkpoint}")
+        checkpoint = torch.load(base_checkpoint, map_location="cpu")
+        raw_state_dict = checkpoint.get("model", checkpoint)
 
-    filtered_state_dict = {}
-    for key, value in raw_state_dict.items():
-        if key.startswith("inference_model."):
-            continue
-        if ".lora_" in key:
-            continue
-        new_key = key.replace(".base_layer.", ".")
-        if new_key == "gpt.wte.weight":
-            continue
-        filtered_state_dict[new_key] = value
-    state_dict = filtered_state_dict
+        filtered_state_dict = {}
+        for key, value in raw_state_dict.items():
+            if key.startswith("inference_model."):
+                continue
+            if ".lora_" in key:
+                continue
+            new_key = key.replace(".base_layer.", ".")
+            if new_key == "gpt.wte.weight":
+                continue
+            filtered_state_dict[new_key] = value
+        state_dict = filtered_state_dict
 
-    resizable_keys = {
-        "text_embedding.weight": model.text_embedding.weight,
-        "text_head.weight": model.text_head.weight,
-        "text_head.bias": model.text_head.bias,
-    }
-    for key, param in resizable_keys.items():
-        weight = state_dict.pop(key, None)
-        if weight is None:
-            continue
-        with torch.no_grad():
-            slices = tuple(min(a, b) for a, b in zip(param.shape, weight.shape))
-            if param.ndim == 1:
-                param[: slices[0]].copy_(weight[: slices[0]])
-            else:
-                param[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
-        state_dict[key] = param.detach().clone()
+        resizable_keys = {
+            "text_embedding.weight": model.text_embedding.weight,
+            "text_head.weight": model.text_head.weight,
+            "text_head.bias": model.text_head.bias,
+        }
+        for key, param in resizable_keys.items():
+            weight = state_dict.pop(key, None)
+            if weight is None:
+                continue
+            with torch.no_grad():
+                slices = tuple(min(a, b) for a, b in zip(param.shape, weight.shape))
+                if param.ndim == 1:
+                    param[: slices[0]].copy_(weight[: slices[0]])
+                else:
+                    param[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
+            state_dict[key] = param.detach().clone()
 
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        print(f"[Warn] Missing keys during load: {missing}")
-    if unexpected:
-        print(f"[Warn] Unexpected keys during load: {unexpected}")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[Warn] Missing keys during load: {missing}")
+        if unexpected:
+            print(f"[Warn] Unexpected keys during load: {unexpected}")
+    else:
+        if base_checkpoint is not None:
+            print(f"[Warn] Base checkpoint not found: {base_checkpoint}, training from scratch.")
+        else:
+            print("[Info] No base checkpoint provided, training from scratch.")
 
     return model.to(device)
 
