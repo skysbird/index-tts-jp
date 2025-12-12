@@ -154,16 +154,12 @@ def debug_inference_steps(
     
     style = tts.campplus_model(feat)  # 使用 campplus_model 提取 style
     
-    # 提取 speaker conditioning（使用语义特征 embedding，而不是原始音频）
-    # spk_cond_emb 已经是语义特征 embedding，格式是 (batch, time, dim)
-    # get_conditioning 需要 (batch, time, dim) 格式
-    spk_cond_emb_for_gpt = spk_cond_emb.transpose(1, 2)  # (batch, time, dim) -> (batch, dim, time)
-    cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device_obj)
-    spk_cond_emb_gpt = tts.gpt.get_conditioning(spk_cond_emb_for_gpt.transpose(1, 2), cond_lengths)  # 转回 (batch, time, dim)
+    # 提取 speaker conditioning
+    # spk_cond_emb 是 (batch, time, dim) 格式，这是语义特征 embedding
+    # 不需要单独调用 get_conditioning，因为 merge_emovec 和 inference_speech 会内部处理
     
     print(f"  ref_mel shape: {ref_mel.shape}")
     print(f"  spk_cond_emb (semantic) shape: {spk_cond_emb.shape}")
-    print(f"  spk_cond_emb_gpt (conditioning) shape: {spk_cond_emb_gpt.shape}")
     print(f"  style shape: {style.shape}")
     print(f"  prompt_condition shape: {prompt_condition.shape}")
     
@@ -186,14 +182,13 @@ def debug_inference_steps(
         device=device_obj
     ).unsqueeze(0)
     
-    # merge_emovec 需要 (batch, dim, time) 格式的语义特征
-    # spk_cond_emb 是 (batch, time, dim)，需要转换为 (batch, dim, time)
-    spk_cond_emb_for_merge = spk_cond_emb.transpose(1, 2)  # (batch, time, dim) -> (batch, dim, time)
+    # merge_emovec 和 inference_speech 都期望 (batch, time, dim) 格式的语义特征
+    # 参考 infer_v2_modded.py 第577-583行
     emovec = tts.gpt.merge_emovec(
-        spk_cond_emb_for_merge,
-        spk_cond_emb_for_merge,  # 使用相同的作为 emo_speech_conditioning_latent
-        torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
-        torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
+        spk_cond_emb,  # (batch, time, dim)
+        spk_cond_emb,  # 使用相同的作为 emo_speech_conditioning_latent
+        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),  # 使用 shape[-1] 即 dim
+        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
         alpha=1.0
     )
     
