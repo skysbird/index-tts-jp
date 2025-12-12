@@ -1337,25 +1337,38 @@ def main() -> None:
     resume_path: str | None = None
     if args.resume:
         if args.resume == "auto":
+            output_dir_abs = output_dir.resolve()
+            print(f"[Info] Auto-resume: searching for checkpoints")
+            print(f"[Info]   Output directory: {output_dir_abs}")
+            print(f"[Info]   Directory exists: {output_dir_abs.exists()}")
+            if output_dir_abs.exists():
+                all_files = list(output_dir_abs.iterdir())
+                print(f"[Info]   Files in directory: {[f.name for f in all_files if f.is_file()]}")
             # 首先尝试 latest.pth
-            candidate = output_dir / "latest.pth"
+            candidate = output_dir_abs / "latest.pth"
             if candidate.exists():
                 resume_path = str(candidate)
-                print(f"[Info] Found latest.pth, will resume from it.")
+                print(f"[Info] ✓ Found latest.pth: {resume_path}")
             else:
+                print(f"[Info] ✗ latest.pth not found at {candidate}")
                 # 如果没有 latest.pth，尝试找最新的 model_step*.pth
-                pattern = str(output_dir / "model_step*.pth")
+                pattern = str(output_dir_abs / "model_step*.pth")
+                print(f"[Info] Searching for checkpoints matching: {pattern}")
                 checkpoints = glob.glob(pattern)
                 if checkpoints:
                     # 按修改时间排序，取最新的
                     checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                     resume_path = checkpoints[0]
-                    print(f"[Info] latest.pth not found, will resume from latest checkpoint: {resume_path}")
+                    print(f"[Info] ✓ Found {len(checkpoints)} checkpoint(s), will resume from latest: {resume_path}")
+                    print(f"[Info]   (All checkpoints: {checkpoints[:5]}{'...' if len(checkpoints) > 5 else ''})")
                 else:
-                    print(f"[Info] No checkpoint found in {output_dir}, starting from scratch.")
+                    print(f"[Info] ✗ No checkpoint files found in {output_dir_abs}")
+                    print(f"[Info]   (Checked pattern: {pattern})")
+                    print(f"[Info]   Starting from scratch.")
                     resume_path = None
         else:
             resume_path = args.resume
+            print(f"[Info] Resuming from specified checkpoint: {resume_path}")
     if resume_path:
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
