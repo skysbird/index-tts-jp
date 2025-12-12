@@ -92,6 +92,19 @@ def test_vocoder(wav_path: Path, config_path: Path, output_dir: Path = None, dev
     reconstructed = torch.clamp(reconstructed, -1.0, 1.0)
     original = torch.clamp(waveform, -1.0, 1.0)
     
+    # 确保音频格式正确：torchaudio.save 期望 (channels, samples) 格式
+    # 如果是 3D tensor (batch, channels, samples)，去掉 batch 维度
+    if reconstructed.ndim == 3:
+        reconstructed = reconstructed.squeeze(0)  # (batch, channels, samples) -> (channels, samples)
+    if original.ndim == 3:
+        original = original.squeeze(0)
+    
+    # 如果是单声道且是 1D，转换为 2D (1, samples)
+    if reconstructed.ndim == 1:
+        reconstructed = reconstructed.unsqueeze(0)
+    if original.ndim == 1:
+        original = original.unsqueeze(0)
+    
     # 保存结果
     if output_dir is None:
         output_dir = wav_path.parent / "vocoder_test_output"
