@@ -113,12 +113,14 @@ def debug_inference_steps(
     audio, sr = torchaudio.load(spk_audio_prompt)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
-    audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio).to(device_obj)
-    audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio).to(device_obj)
+    
+    # 重采样（保持在 CPU 上，因为 extract_features 需要 CPU）
+    audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+    audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
     
     # 提取 conditioning
-    # 使用正确的方法提取语义特征
-    inputs = tts.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+    # 使用正确的方法提取语义特征（extract_features 需要 CPU 上的 numpy 数组）
+    inputs = tts.extract_features(audio_16k.squeeze().numpy(), sampling_rate=16000, return_tensors="pt")
     input_features = inputs["input_features"].to(device_obj)
     attention_mask = inputs["attention_mask"].to(device_obj)
     spk_cond_emb = tts.get_emb(input_features, attention_mask)
@@ -126,12 +128,16 @@ def debug_inference_steps(
     # 量化得到 S_ref
     _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
     
+    # 将音频移到 GPU 用于后续处理
+    audio_22k = audio_22k.to(device_obj)
+    audio_16k_gpu = audio_16k.to(device_obj)
+    
     ref_mel = tts.mel_fn(audio_22k.float())
     ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device_obj)
     
     # 提取 fbank 特征用于 style encoder
     feat = torchaudio.compliance.kaldi.fbank(
-        audio_16k.float(),
+        audio_16k_gpu.float(),
         num_mel_bins=80,
         dither=0,
         sample_frequency=16000
@@ -149,8 +155,8 @@ def debug_inference_steps(
     style = tts.campplus_model(feat)  # 使用 campplus_model 提取 style
     
     # 提取 speaker conditioning
-    spk_cond_emb = tts.gpt.get_conditioning(audio_22k.to(device_obj).float())
-    emo_cond_emb = tts.gpt.get_emovec(audio_22k.to(device_obj).float())
+    spk_cond_emb = tts.gpt.get_conditioning(audio_22k.float())
+    emo_cond_emb = tts.gpt.get_emovec(audio_22k.float())
     
     print(f"  ref_mel shape: {ref_mel.shape}")
     print(f"  spk_cond_emb shape: {spk_cond_emb.shape}")
