@@ -34,10 +34,10 @@ def save_mel_spectrogram(mel, path, title="Mel Spectrogram"):
     print(f"  Saved mel spectrogram: {path}")
 
 
-def mel_to_audio_via_vocoder(mel, vocoder, device, sr=22050):
+def mel_to_audio_via_vocoder(mel, vocoder, device_obj, sr=22050):
     """使用 vocoder 将梅尔频谱图转换为音频（用于测试）"""
     with torch.no_grad():
-        mel = mel.to(device)
+        mel = mel.to(device_obj)
         audio = vocoder(mel.float())
         audio = audio.cpu()
         # 处理维度
@@ -59,8 +59,12 @@ def debug_inference_steps(
 ):
     """分步调试推理流程"""
     
-    device = torch.device(device if torch.cuda.is_available() else "cpu")
-    print(f"[Info] Using device: {device}")
+    # 确定设备字符串
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    device_str = device
+    device_obj = torch.device(device_str)
+    print(f"[Info] Using device: {device_str}")
     
     # 创建输出目录
     output_dir = Path(output_dir)
@@ -72,7 +76,7 @@ def debug_inference_steps(
         cfg_path=str(config_path),
         model_dir=str(model_dir),
         use_fp16=False,
-        device=device
+        device=device_str
     )
     print("[Info] Model loaded successfully")
     
@@ -80,7 +84,7 @@ def debug_inference_steps(
     print("[Info] Loading BigVGAN for intermediate testing...")
     config = OmegaConf.load(config_path)
     vocoder = bigvgan.BigVGAN.from_pretrained(config.vocoder.name, use_cuda_kernel=False)
-    vocoder = vocoder.to(device)
+    vocoder = vocoder.to(device_obj)
     vocoder.remove_weight_norm()
     vocoder.eval()
     print("[Info] BigVGAN loaded")
@@ -109,19 +113,19 @@ def debug_inference_steps(
     audio, sr = torchaudio.load(spk_audio_prompt)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
-    audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio).to(device)
-    audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio).to(device)
+    audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio).to(device_obj)
+    audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio).to(device_obj)
     
     # 提取 conditioning
     ref_mel = tts.mel_fn(audio_22k.float())
-    ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device)
+    ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device_obj)
     
     feat = torchaudio.compliance.kaldi.fbank(
         audio_16k.float(),
         num_mel_bins=80,
         dither=0,
         sample_frequency=16000
-    ).unsqueeze(0).to(device)
+    ).unsqueeze(0).to(device_obj)
     
     S_ref = tts.semantic_codec.quantizer.vq2emb(
         tts.semantic_codec.quantizer.encode(feat)[0].unsqueeze(0)
@@ -138,8 +142,8 @@ def debug_inference_steps(
     style = tts.s2mel.models['style_encoder'](ref_mel)
     
     # 提取 speaker conditioning
-    spk_cond_emb = tts.gpt.get_conditioning(audio_22k.to(device).float())
-    emo_cond_emb = tts.gpt.get_emovec(audio_22k.to(device).float())
+    spk_cond_emb = tts.gpt.get_conditioning(audio_22k.to(device_obj).float())
+    emo_cond_emb = tts.gpt.get_emovec(audio_22k.to(device_obj).float())
     
     print(f"  ref_mel shape: {ref_mel.shape}")
     print(f"  spk_cond_emb shape: {spk_cond_emb.shape}")
@@ -151,7 +155,7 @@ def debug_inference_steps(
     save_mel_spectrogram(ref_mel, output_dir / "step2_ref_mel.png", "Reference Audio Mel Spectrogram")
     
     # 测试：用 vocoder 重建参考音频（验证 vocoder 质量）
-    ref_audio_reconstructed = mel_to_audio_via_vocoder(ref_mel, vocoder, device)
+    ref_audio_reconstructed = mel_to_audio_via_vocoder(ref_mel, vocoder, device_obj)
     torchaudio.save(str(output_dir / "step2_ref_audio_reconstructed.wav"), ref_audio_reconstructed, 22050)
     print(f"  Saved reconstructed reference audio: {output_dir / 'step2_ref_audio_reconstructed.wav'}")
     
@@ -163,14 +167,14 @@ def debug_inference_steps(
     text_tokens_tensor = torch.tensor(
         tts.tokenizer.convert_tokens_to_ids(text_tokens),
         dtype=torch.int32,
-        device=device
+        device=device_obj
     ).unsqueeze(0)
     
     emovec = tts.gpt.merge_emovec(
         spk_cond_emb,
         emo_cond_emb,
-        torch.tensor([spk_cond_emb.shape[-1]], device=device),
-        torch.tensor([emo_cond_emb.shape[-1]], device=device),
+        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
+        torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
         alpha=1.0
     )
     
@@ -179,8 +183,8 @@ def debug_inference_steps(
             spk_cond_emb,
             text_tokens_tensor,
             emo_cond_emb,
-            cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device),
-            emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device),
+            cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
+            emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
             emo_vec=emovec,
             do_sample=True,
             top_p=0.8,
@@ -237,19 +241,19 @@ def debug_inference_steps(
     print("Step 5: GPT Forward Pass")
     print("="*80)
     
-    code_lens = torch.LongTensor([codes.shape[-1]]).to(device)
-    use_speed = torch.zeros(spk_cond_emb.size(0)).to(device).long()
+    code_lens = torch.LongTensor([codes.shape[-1]]).to(device_obj)
+    use_speed = torch.zeros(spk_cond_emb.size(0)).to(device_obj).long()
     
     with torch.no_grad():
         latent = tts.gpt(
             speech_conditioning_latent,
             text_tokens_tensor,
-            torch.tensor([text_tokens_tensor.shape[-1]], device=device),
+            torch.tensor([text_tokens_tensor.shape[-1]], device=device_obj),
             codes,
             code_lens,
             emo_cond_emb,
-            cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device),
-            emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device),
+            cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
+            emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
             emo_vec=emovec,
             use_speed=use_speed,
         )
@@ -314,7 +318,7 @@ def debug_inference_steps(
     
     # 测试：用 vocoder 转换生成的梅尔频谱图（这是关键测试！）
     print("\n  Testing generated mel with vocoder...")
-    generated_audio = mel_to_audio_via_vocoder(vc_target, vocoder, device)
+    generated_audio = mel_to_audio_via_vocoder(vc_target, vocoder, device_obj)
     torchaudio.save(str(output_dir / "step7_generated_audio_from_mel.wav"), generated_audio, 22050)
     print(f"  Saved audio from generated mel: {output_dir / 'step7_generated_audio_from_mel.wav'}")
     print(f"  ⚠️  This is the key test! If this audio has noise, the problem is in S2Mel or earlier steps.")
