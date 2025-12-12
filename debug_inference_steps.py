@@ -117,20 +117,27 @@ def debug_inference_steps(
     audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio).to(device_obj)
     
     # 提取 conditioning
+    # 使用正确的方法提取语义特征
+    inputs = tts.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+    input_features = inputs["input_features"].to(device_obj)
+    attention_mask = inputs["attention_mask"].to(device_obj)
+    spk_cond_emb = tts.get_emb(input_features, attention_mask)
+    
+    # 量化得到 S_ref
+    _, S_ref = tts.semantic_codec.quantize(spk_cond_emb)
+    
     ref_mel = tts.mel_fn(audio_22k.float())
     ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(device_obj)
     
+    # 提取 fbank 特征用于 style encoder
     feat = torchaudio.compliance.kaldi.fbank(
         audio_16k.float(),
         num_mel_bins=80,
         dither=0,
         sample_frequency=16000
-    ).unsqueeze(0).to(device_obj)
-    
-    S_ref = tts.semantic_codec.quantizer.vq2emb(
-        tts.semantic_codec.quantizer.encode(feat)[0].unsqueeze(0)
     )
-    S_ref = S_ref.transpose(1, 2)
+    feat = feat - feat.mean(dim=0, keepdim=True)
+    feat = feat.unsqueeze(0).to(device_obj)
     
     prompt_condition = tts.s2mel.models['length_regulator'](
         S_ref,
@@ -139,7 +146,7 @@ def debug_inference_steps(
         f0=None,
     )[0]
     
-    style = tts.s2mel.models['style_encoder'](ref_mel)
+    style = tts.campplus_model(feat)  # 使用 campplus_model 提取 style
     
     # 提取 speaker conditioning
     spk_cond_emb = tts.gpt.get_conditioning(audio_22k.to(device_obj).float())
