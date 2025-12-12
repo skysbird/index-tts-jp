@@ -154,13 +154,20 @@ def debug_inference_steps(
     
     style = tts.campplus_model(feat)  # 使用 campplus_model 提取 style
     
-    # 提取 speaker conditioning
-    spk_cond_emb = tts.gpt.get_conditioning(audio_22k.float())
-    emo_cond_emb = tts.gpt.get_emovec(audio_22k.float())
+    # 提取 speaker conditioning（使用语义特征 embedding，而不是原始音频）
+    # spk_cond_emb 已经是语义特征 embedding，格式是 (batch, time, dim)
+    # get_conditioning 需要 (batch, time, dim) 格式
+    spk_cond_emb_for_gpt = spk_cond_emb.transpose(1, 2)  # (batch, dim, time) -> (batch, time, dim)
+    cond_lengths = torch.tensor([spk_cond_emb.shape[1]], device=device_obj)
+    spk_cond_emb_gpt = tts.gpt.get_conditioning(spk_cond_emb_for_gpt, cond_lengths)
+    emo_cond_emb_gpt = tts.gpt.get_emo_conditioning(spk_cond_emb_for_gpt, cond_lengths)
+    emo_cond_emb_gpt = tts.gpt.emovec_layer(emo_cond_emb_gpt)
+    emo_cond_emb_gpt = tts.gpt.emo_layer(emo_cond_emb_gpt)
     
     print(f"  ref_mel shape: {ref_mel.shape}")
-    print(f"  spk_cond_emb shape: {spk_cond_emb.shape}")
-    print(f"  emo_cond_emb shape: {emo_cond_emb.shape}")
+    print(f"  spk_cond_emb (semantic) shape: {spk_cond_emb.shape}")
+    print(f"  spk_cond_emb_gpt (conditioning) shape: {spk_cond_emb_gpt.shape}")
+    print(f"  emo_cond_emb_gpt shape: {emo_cond_emb_gpt.shape}")
     print(f"  style shape: {style.shape}")
     print(f"  prompt_condition shape: {prompt_condition.shape}")
     
@@ -184,20 +191,20 @@ def debug_inference_steps(
     ).unsqueeze(0)
     
     emovec = tts.gpt.merge_emovec(
-        spk_cond_emb,
-        emo_cond_emb,
-        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
-        torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
+        spk_cond_emb_gpt,
+        emo_cond_emb_gpt,
+        torch.tensor([spk_cond_emb_gpt.shape[-1]], device=device_obj),
+        torch.tensor([emo_cond_emb_gpt.shape[-1]], device=device_obj),
         alpha=1.0
     )
     
     with torch.no_grad():
         codes, speech_conditioning_latent = tts.gpt.inference_speech(
-            spk_cond_emb,
+            spk_cond_emb.transpose(1, 2),  # (batch, time, dim) -> (batch, dim, time)
             text_tokens_tensor,
-            emo_cond_emb,
-            cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
-            emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
+            spk_cond_emb.transpose(1, 2),  # 使用相同的作为 emo_speech_condition
+            cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
+            emo_cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
             emo_vec=emovec,
             do_sample=True,
             top_p=0.8,
@@ -264,9 +271,9 @@ def debug_inference_steps(
             torch.tensor([text_tokens_tensor.shape[-1]], device=device_obj),
             codes,
             code_lens,
-            emo_cond_emb,
-            cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
-            emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=device_obj),
+            spk_cond_emb.transpose(1, 2),  # emo_speech_condition
+            cond_mel_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
+            emo_cond_mel_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
             emo_vec=emovec,
             use_speed=use_speed,
         )
