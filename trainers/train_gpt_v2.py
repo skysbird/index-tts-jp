@@ -19,6 +19,7 @@ chosen output directory.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
@@ -1336,9 +1337,23 @@ def main() -> None:
     resume_path: str | None = None
     if args.resume:
         if args.resume == "auto":
+            # 首先尝试 latest.pth
             candidate = output_dir / "latest.pth"
             if candidate.exists():
                 resume_path = str(candidate)
+                print(f"[Info] Found latest.pth, will resume from it.")
+            else:
+                # 如果没有 latest.pth，尝试找最新的 model_step*.pth
+                pattern = str(output_dir / "model_step*.pth")
+                checkpoints = glob.glob(pattern)
+                if checkpoints:
+                    # 按修改时间排序，取最新的
+                    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                    resume_path = checkpoints[0]
+                    print(f"[Info] latest.pth not found, will resume from latest checkpoint: {resume_path}")
+                else:
+                    print(f"[Info] No checkpoint found in {output_dir}, starting from scratch.")
+                    resume_path = None
         else:
             resume_path = args.resume
     if resume_path:
