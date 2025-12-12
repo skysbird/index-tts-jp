@@ -1216,7 +1216,34 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(log_dir))
 
     tokenizer = load_tokenizer(args.tokenizer)
-    model = build_model(args.config, tokenizer, args.base_checkpoint, device)
+    
+    # 如果使用 resume，先检查是否会 resume，避免重复加载 base_checkpoint
+    will_resume = False
+    resume_path: str | None = None
+    if args.resume:
+        if args.resume == "auto":
+            output_dir_abs = output_dir.resolve()
+            candidate = output_dir_abs / "latest.pth"
+            if candidate.exists():
+                resume_path = str(candidate)
+                will_resume = True
+            else:
+                pattern = str(output_dir_abs / "model_step*.pth")
+                checkpoints = glob.glob(pattern)
+                if checkpoints:
+                    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                    resume_path = checkpoints[0]
+                    will_resume = True
+        else:
+            resume_path = args.resume
+            will_resume = True
+    
+    # 如果会 resume，就不加载 base_checkpoint（resume 的 checkpoint 已经包含模型权重）
+    base_checkpoint_to_use = None if will_resume else args.base_checkpoint
+    if will_resume:
+        print(f"[Info] Will resume from checkpoint, skipping base_checkpoint loading.")
+    
+    model = build_model(args.config, tokenizer, base_checkpoint_to_use, device)
 
     # 加载semantic_extractor和semantic_codec（当ignore_pretrained_features=True时）
     semantic_extractor = None
@@ -1334,42 +1361,21 @@ def main() -> None:
     recent_checkpoints: List[str] = []
     last_saved_step: int | None = None
 
-    resume_path: str | None = None
-    if args.resume:
+    # 如果之前已经确定了 resume_path，现在加载 checkpoint
+    if resume_path:
+        # 打印详细信息
         if args.resume == "auto":
             output_dir_abs = output_dir.resolve()
-            print(f"[Info] Auto-resume: searching for checkpoints")
+            print(f"[Info] Auto-resume: loading checkpoint")
             print(f"[Info]   Output directory: {output_dir_abs}")
-            print(f"[Info]   Directory exists: {output_dir_abs.exists()}")
+            print(f"[Info]   Checkpoint path: {resume_path}")
             if output_dir_abs.exists():
                 all_files = list(output_dir_abs.iterdir())
-                print(f"[Info]   Files in directory: {[f.name for f in all_files if f.is_file()]}")
-            # 首先尝试 latest.pth
-            candidate = output_dir_abs / "latest.pth"
-            if candidate.exists():
-                resume_path = str(candidate)
-                print(f"[Info] ✓ Found latest.pth: {resume_path}")
-            else:
-                print(f"[Info] ✗ latest.pth not found at {candidate}")
-                # 如果没有 latest.pth，尝试找最新的 model_step*.pth
-                pattern = str(output_dir_abs / "model_step*.pth")
-                print(f"[Info] Searching for checkpoints matching: {pattern}")
-                checkpoints = glob.glob(pattern)
-                if checkpoints:
-                    # 按修改时间排序，取最新的
-                    checkpoints.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-                    resume_path = checkpoints[0]
-                    print(f"[Info] ✓ Found {len(checkpoints)} checkpoint(s), will resume from latest: {resume_path}")
-                    print(f"[Info]   (All checkpoints: {checkpoints[:5]}{'...' if len(checkpoints) > 5 else ''})")
-                else:
-                    print(f"[Info] ✗ No checkpoint files found in {output_dir_abs}")
-                    print(f"[Info]   (Checked pattern: {pattern})")
-                    print(f"[Info]   Starting from scratch.")
-                    resume_path = None
+                checkpoint_files = [f.name for f in all_files if f.is_file() and f.suffix == '.pth']
+                print(f"[Info]   Available checkpoint files: {checkpoint_files}")
         else:
-            resume_path = args.resume
             print(f"[Info] Resuming from specified checkpoint: {resume_path}")
-    if resume_path:
+        
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
