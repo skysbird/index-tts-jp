@@ -1360,6 +1360,8 @@ def main() -> None:
     start_epoch = 0
     recent_checkpoints: List[str] = []
     last_saved_step: int | None = None
+    resumed_from_checkpoint = False  # 标记是否从 checkpoint resume
+    checkpoint_has_scheduler = False  # 标记 checkpoint 中是否有 scheduler 状态
 
     # 如果之前已经确定了 resume_path，现在加载 checkpoint
     if resume_path:
@@ -1379,21 +1381,74 @@ def main() -> None:
         checkpoint = torch.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
-        # 不加载 scheduler 状态，使用新的学习率重新开始
-        # 这样可以在 resume 时通过 --learning-rate 参数调整学习率
-        # if checkpoint.get("scheduler"):
-        #     scheduler.load_state_dict(checkpoint["scheduler"])
+        checkpoint_has_scheduler = checkpoint.get("scheduler") is not None
         if scaler and checkpoint.get("scaler"):
             scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = checkpoint.get("epoch", 0)
         global_step = checkpoint.get("step", 0)
         recent_checkpoints = checkpoint.get("recent_checkpoints", [])
         last_saved_step = checkpoint.get("step")
-        # 手动设置 optimizer 的学习率为新的值
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = args.learning_rate
-        print(f"[Info] Resumed from {resume_path} at epoch {start_epoch}, step {global_step}.")
-        print(f"[Info] Learning rate reset to: {args.learning_rate} (scheduler will restart from this LR).")
+        
+        # 尝试恢复 scheduler 状态（如果 checkpoint 中有的话）
+        if checkpoint_has_scheduler:
+            try:
+                scheduler.load_state_dict(checkpoint["scheduler"])
+                print(f"[Info] Restored scheduler state from checkpoint")
+            except Exception as e:
+                print(f"[Warn] Failed to restore scheduler state: {e}, will recalculate")
+                # 如果恢复失败，手动计算学习率
+                if global_step < args.warmup_steps:
+                    lr_scale = global_step / max(1, args.warmup_steps)
+                    current_lr = args.learning_rate * lr_scale
+                elif args.min_learning_rate > 0:
+                    progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                    progress = min(progress, 1.0)
+                    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                    current_lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine_decay
+                else:
+                    progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                    progress = min(progress, 1.0)
+                    cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                    current_lr = args.learning_rate * cosine_decay
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+        else:
+            # Checkpoint 中没有 scheduler 状态，手动计算并设置学习率
+            if global_step < args.warmup_steps:
+                lr_scale = global_step / max(1, args.warmup_steps)
+                current_lr = args.learning_rate * lr_scale
+            elif args.min_learning_rate > 0:
+                progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                progress = min(progress, 1.0)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                current_lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine_decay
+            else:
+                progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                progress = min(progress, 1.0)
+                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                current_lr = args.learning_rate * cosine_decay
+            
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+            
+            # 将 scheduler 推进到正确的步数（使用快速方法：直接设置内部状态）
+            # 注意：transformers 的 CosineAnnealingLR 内部使用 last_epoch 来跟踪步数
+            # 我们可以通过多次调用 step() 来推进，但这样会很慢
+            # 更好的方法是直接修改 scheduler 的内部状态（如果可能）
+            # 由于 transformers 的 scheduler 不直接支持，我们采用折中方案：
+            # 只在 resume 时手动设置学习率，后续训练中继续使用手动计算的学习率覆盖
+            
+        current_lr = optimizer.param_groups[0]['lr']
+        resumed_from_checkpoint = True  # 标记已 resume
+        print("=" * 80)
+        print(f"[Info] ✓ RESUMED TRAINING from checkpoint:")
+        print(f"      Checkpoint: {resume_path}")
+        print(f"      Resumed at: epoch {start_epoch + 1}, step {global_step}")
+        print(f"      Current learning rate: {current_lr:.2e}")
+        print(f"      Total steps: {total_steps}, Warmup steps: {args.warmup_steps}")
+        if not checkpoint_has_scheduler:
+            print(f"      Note: Scheduler state not found, will manually calculate LR in training loop")
+        print("=" * 80)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1452,11 +1507,27 @@ def main() -> None:
                     optimizer.step()
                 scheduler.step()
                 
-                # 如果设置了最小学习率，手动调整（因为 transformers 的调度器默认衰减到 0）
-                if args.min_learning_rate > 0 and global_step > args.warmup_steps:
-                    # 计算余弦衰减的进度（warmup 之后的部分）
+                # 如果 resume 了且 checkpoint 中没有 scheduler 状态，或者设置了最小学习率，手动计算学习率
+                if resumed_from_checkpoint and not checkpoint_has_scheduler:
+                    # Resume 后手动计算学习率（因为 scheduler 状态不正确）
+                    if global_step < args.warmup_steps:
+                        lr_scale = global_step / max(1, args.warmup_steps)
+                        current_lr = args.learning_rate * lr_scale
+                    elif args.min_learning_rate > 0:
+                        progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                        progress = min(progress, 1.0)
+                        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                        current_lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine_decay
+                    else:
+                        progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
+                        progress = min(progress, 1.0)
+                        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+                        current_lr = args.learning_rate * cosine_decay
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = current_lr
+                elif args.min_learning_rate > 0 and global_step > args.warmup_steps:
+                    # 如果设置了最小学习率，手动调整（因为 transformers 的调度器默认衰减到 0）
                     progress = (global_step - args.warmup_steps) / max(1, total_steps - args.warmup_steps)
-                    # 余弦衰减：从 max_lr 衰减到 min_lr
                     cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
                     current_lr = args.min_learning_rate + (args.learning_rate - args.min_learning_rate) * cosine_decay
                     for param_group in optimizer.param_groups:
