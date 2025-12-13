@@ -527,8 +527,10 @@ class IndexTTS2:
         temperature = generation_kwargs.pop("temperature", 0.8)
         autoregressive_batch_size = 1
         length_penalty = generation_kwargs.pop("length_penalty", 0.0)
-        num_beams = generation_kwargs.pop("num_beams", 3)
-        repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
+        # 修复：将 num_beams 从 3 改为 1，匹配 Step 3 的纯采样行为
+        num_beams = generation_kwargs.pop("num_beams", 1)
+        # 修复：将 repetition_penalty 从 10.0 改为 1.2，这是一个更合理的值（通常范围是 1.0-2.0）
+        repetition_penalty = generation_kwargs.pop("repetition_penalty", 1.2)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
         sampling_rate = 22050
 
