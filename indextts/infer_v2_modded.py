@@ -574,11 +574,12 @@ class IndexTTS2:
             m_start_time = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    # 修复：使用 shape[1]（时间维度）而不是 shape[-1]（特征维度）
                     emovec = self.gpt.merge_emovec(
                         spk_cond_emb,
                         emo_cond_emb,
-                        torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         alpha=emo_alpha
                     )
 
@@ -589,12 +590,13 @@ class IndexTTS2:
                     sentence_duration_tokens = None
                     if duration_plan:
                         sentence_duration_tokens = duration_plan[min(idx_sent, len(duration_plan) - 1)]
+                    # 修复：使用 shape[1]（时间维度）而不是 shape[-1]（特征维度）
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
                         emo_cond_emb,
-                        cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        emo_cond_lengths=torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         emo_vec=emovec,
                         do_sample=True,
                         top_p=top_p,
@@ -645,6 +647,7 @@ class IndexTTS2:
                 m_start_time = time.perf_counter()
                 use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                    # 修复：使用 shape[1]（时间维度）而不是 shape[-1]（特征维度）
                     latent = self.gpt(
                         speech_conditioning_latent,
                         text_tokens,
@@ -652,8 +655,8 @@ class IndexTTS2:
                         codes,
                         torch.tensor([codes.shape[-1]], device=text_tokens.device),
                         emo_cond_emb,
-                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                        emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
+                        cond_mel_lengths=torch.tensor([spk_cond_emb.shape[1]], device=text_tokens.device),
+                        emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[1]], device=text_tokens.device),
                         emo_vec=emovec,
                         use_speed=use_speed,
                     )
