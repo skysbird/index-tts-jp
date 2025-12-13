@@ -316,14 +316,16 @@ def debug_inference_steps(
     )
     
     with torch.no_grad():
+        # cfm.inference 的参数顺序：mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5
         vc_target = tts.s2mel.models['cfm'].inference(
-            cat_condition,
-            mel_lengths,
-            ref_mel,
-            style,
-            None,
-            diffusion_steps=25,
-            inference_cfg_rate=0.7,
+            cat_condition,  # mu
+            mel_lengths,  # x_lens
+            ref_mel,  # prompt
+            style,  # style
+            None,  # f0
+            25,  # n_timesteps (diffusion_steps)
+            temperature=1.0,  # temperature
+            inference_cfg_rate=0.7,  # inference_cfg_rate
         )
         vc_target = vc_target[:, :, ref_mel.size(-1):]
     
