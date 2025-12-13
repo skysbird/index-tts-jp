@@ -182,27 +182,23 @@ def debug_inference_steps(
         device=device_obj
     ).unsqueeze(0)
     
-    # 参考 infer_v2_modded.py 第577-583行和592-597行
-    # merge_emovec 直接传入 (batch, time, dim) 格式，内部会处理转置
-    # 注意：cond_lengths 在 infer_v2_modded.py 中使用的是 shape[-1]（即 dim），这看起来不对
-    # 但为了保持一致，我们也使用 shape[-1]
+    # 修复：使用 shape[1]（时间维度）而不是 shape[-1]（特征维度），与修复后的 infer_v2_modded.py 保持一致
     emovec = tts.gpt.merge_emovec(
         spk_cond_emb,  # (batch, time, dim) - 直接传入，内部会转置
         spk_cond_emb,  # 使用相同的作为 emo_speech_conditioning_latent
-        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),  # 使用 shape[-1] 保持与 infer_v2_modded.py 一致
-        torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
+        torch.tensor([spk_cond_emb.shape[1]], device=device_obj),  # 修复：使用 shape[1]（时间维度）
+        torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
         alpha=1.0
     )
     
     with torch.no_grad():
-        # inference_speech 直接传入 (batch, time, dim) 格式（参考 infer_v2_modded.py 第592-597行）
-        # 内部会处理转置，cond_lengths 使用 shape[-1]（虽然看起来不对，但为了保持一致）
+        # 修复：使用 shape[1]（时间维度）而不是 shape[-1]（特征维度），与修复后的 infer_v2_modded.py 保持一致
         codes, speech_conditioning_latent = tts.gpt.inference_speech(
             spk_cond_emb,  # (batch, time, dim) - 直接传入，内部会转置
             text_tokens_tensor,
             spk_cond_emb,  # 使用相同的作为 emo_speech_condition
-            cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),  # 使用 shape[-1] 保持与 infer_v2_modded.py 一致
-            emo_cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=device_obj),
+            cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),  # 修复：使用 shape[1]（时间维度）
+            emo_cond_lengths=torch.tensor([spk_cond_emb.shape[1]], device=device_obj),
             emo_vec=emovec,
             do_sample=True,
             top_p=0.8,
