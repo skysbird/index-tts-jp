@@ -339,6 +339,8 @@ def debug_inference_steps(
     # 测试：用 vocoder 转换生成的梅尔频谱图（这是关键测试！）
     print("\n  Testing generated mel with vocoder...")
     generated_audio = mel_to_audio_via_vocoder(vc_target, vocoder, device_obj)
+    print(f"  Generated audio shape: {generated_audio.shape}")
+    print(f"  Generated audio range: min={generated_audio.min():.4f}, max={generated_audio.max():.4f}, abs_max={generated_audio.abs().max():.4f}")
     torchaudio.save(str(output_dir / "step7_generated_audio_from_mel.wav"), generated_audio, 22050)
     print(f"  Saved audio from generated mel: {output_dir / 'step7_generated_audio_from_mel.wav'}")
     print(f"  ⚠️  This is the key test! If this audio has noise, the problem is in S2Mel or earlier steps.")

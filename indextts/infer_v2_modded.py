@@ -741,9 +741,17 @@ class IndexTTS2:
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
-                # wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                # 检查 vocoder 输出的范围，如果超出 [-1, 1] 则先归一化
+                wav_max = wav.abs().max()
+                if wav_max > 1.0:
+                    if verbose:
+                        print(f"Warning: vocoder output range exceeds [-1, 1], max={wav_max:.4f}, normalizing...")
+                    wav = wav / wav_max
+                
+                # 缩放到 int16 范围
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max(), "original_max:", wav_max.item() if isinstance(wav_max, torch.Tensor) else wav_max)
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
         end_time = time.perf_counter()
