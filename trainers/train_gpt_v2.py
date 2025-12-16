@@ -814,9 +814,8 @@ def compute_losses(
                 # - conditioning从prompt的codes恢复（如果可用）或从音频提取
                 # - emo_vec从target的codes恢复
                 
-                # 对于conditioning，优先使用prompt_codes恢复
+                # 对于conditioning，优先使用prompt_codes恢复；没有prompt_codes则直接从target codes恢复
                 if "prompt_codes" in batch and batch["prompt_codes"] is not None:
-                    # 从prompt codes恢复conditioning特征
                     prompt_codes_batch = batch["prompt_codes"].to(device)
                     prompt_code_lengths_batch = batch["prompt_code_lengths"].to(device)
                     prompt_feat, prompt_attention_mask = recover_features_from_codes(
@@ -829,57 +828,20 @@ def compute_losses(
                     del prompt_feat, prompt_feat_t, prompt_attention_mask
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
-                elif "condition" in batch and batch["condition"].numel() > 0:
-                    # 使用预提取的conditioning
-                    condition = batch["condition"].to(device)
-                    cond_lengths = batch["condition_lengths"].to(device)
                 else:
-                    # 如果没有prompt_codes和预提取的conditioning，尝试从音频提取（需要semantic_extractor）
-                    if semantic_extractor is not None and audio_roots is not None:
-                        # 从prompt音频提取conditioning
-                        prompt_resolved_paths = []
-                        for idx, audio_path_str in enumerate(prompt_audio_paths):
-                            if not audio_path_str:
-                                raise ValueError(f"Empty prompt_audio_path in batch at index {idx}")
-                            resolved = resolve_audio_path(audio_path_str, audio_roots)
-                            if resolved is None:
-                                raise FileNotFoundError(
-                                    f"Prompt audio file not found: {audio_path_str} "
-                                    f"(searched in {[str(r) for r in audio_roots]})"
-                                )
-                            prompt_resolved_paths.append(resolved)
-                        
-                        prompt_waveforms = []
-                        prompt_sample_rates = []
-                        for audio_path in prompt_resolved_paths:
-                            wav, sr = torchaudio.load(audio_path)
-                            prompt_waveforms.append(wav)
-                            prompt_sample_rates.append(sr)
-                        
-                        prompt_feat, prompt_attention_mask = semantic_extractor.extract(
-                            prompt_waveforms, prompt_sample_rates
-                        )
-                        del prompt_waveforms, prompt_sample_rates
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                        
-                        prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
-                        prompt_feat_t = prompt_feat.transpose(1, 2)
-                        condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
-                        cond_lengths = prompt_cond_lengths
-                        del prompt_feat, prompt_feat_t, prompt_attention_mask
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-                    else:
-                        # 如果既没有prompt_codes，也没有semantic_extractor，则必须使用预提取的conditioning
-                        raise ValueError(
-                            "For paired manifest with codes recovery, either prompt_codes, "
-                            "pre-extracted conditioning (in batch), or semantic_extractor+audio_roots "
-                            "must be provided for prompt conditioning. "
-                            "Current: prompt_codes not in batch, semantic_extractor is None."
-                        )
+                    # 没有prompt_codes时，直接从target codes恢复conditioning
+                    prompt_feat, prompt_attention_mask = recover_features_from_codes(
+                        codes, code_lengths, semantic_codec, device
+                    )
+                    prompt_cond_lengths = prompt_attention_mask.sum(dim=1).long()
+                    prompt_feat_t = prompt_feat.transpose(1, 2)
+                    condition = model.get_conditioning(prompt_feat_t, prompt_cond_lengths)
+                    cond_lengths = prompt_cond_lengths
+                    del prompt_feat, prompt_feat_t, prompt_attention_mask
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                 
-                # 对于emo_vec，从target的codes恢复
+                # emo_vec 一律从 target codes 恢复
                 feat, attention_mask = recover_features_from_codes(
                     codes, code_lengths, semantic_codec, device
                 )
