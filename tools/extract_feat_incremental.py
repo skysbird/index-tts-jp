@@ -266,15 +266,19 @@ def process_batch(
             
             # 保存 target feat（使用 target_id 或 id 作为文件名）
             target_id = record.get("target_id", record.get("id", "").split("__")[0] if "__" in record.get("id", "") else record.get("id", ""))
-            feat_path = feat_dir / f"{target_id}.npy"
-            save_numpy(feat_path, target_feat_np)
+            target_feat_path = feat_dir / f"{target_id}.npy"
+            save_numpy(target_feat_path, target_feat_np)
             
-            # 更新 record
+            # 更新 record（保持与 build_gpt_prompt_pairs.py 生成的格式一致）
             updated_record = record.copy()
             if prompt_id:
-                updated_record["prompt_feat_path"] = prompt_feat_path.relative_to(output_root).as_posix()
+                # 确保 prompt_feat_path 是绝对路径，然后计算相对路径
+                prompt_feat_path_abs = Path(prompt_feat_path).resolve()
+                updated_record["prompt_feat_path"] = prompt_feat_path_abs.relative_to(output_root).as_posix()
                 updated_record["prompt_feat_len"] = int(prompt_feat_np.shape[0])
-            updated_record["feat_path"] = feat_path.relative_to(output_root).as_posix()
+            # target 的 feat_path（保持与现有格式一致，使用 feat_path 而不是 target_feat_path）
+            target_feat_path_abs = Path(target_feat_path).resolve()
+            updated_record["feat_path"] = target_feat_path_abs.relative_to(output_root).as_posix()
             updated_record["feat_len"] = int(target_feat_np.shape[0])
         else:
             # Single: 提取一个 feat
@@ -288,7 +292,9 @@ def process_batch(
             
             # 更新 record
             updated_record = record.copy()
-            updated_record["feat_path"] = feat_path.relative_to(output_root).as_posix()
+            # 确保 feat_path 是绝对路径
+            feat_path_abs = Path(feat_path).resolve()
+            updated_record["feat_path"] = feat_path_abs.relative_to(output_root).as_posix()
             updated_record["feat_len"] = int(feat_np.shape[0])
         
         updated_records.append(updated_record)
@@ -366,10 +372,11 @@ def main() -> None:
     device = torch.device(args.device)
     semantic_extractor = SemanticExtractor(stats_path, device)
     
-    feat_dir = args.output_dir / "feat"
+    # 确保 output_root 和 feat_dir 都是绝对路径
+    output_root = args.output_dir.expanduser().resolve()
+    feat_dir = (output_root / "feat").resolve()
     feat_dir.mkdir(parents=True, exist_ok=True)
     
-    output_root = args.output_dir.resolve()
     audio_roots = [Path(r).expanduser().resolve() for r in args.audio_root]
 
     # 读取 manifest
