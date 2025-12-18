@@ -70,13 +70,26 @@ class SemanticExtractor:
         )
         input_features = inputs["input_features"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
-        outputs = self.semantic_model(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        feat = outputs.hidden_states[17]
-        feat = (feat - self.semantic_mean) / self.semantic_std
+        
+        # 使用混合精度加速（如果 GPU 可用）
+        if self.device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                outputs = self.semantic_model(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+                feat = outputs.hidden_states[17]
+                feat = (feat - self.semantic_mean) / self.semantic_std
+        else:
+            outputs = self.semantic_model(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            feat = outputs.hidden_states[17]
+            feat = (feat - self.semantic_mean) / self.semantic_std
+        
         return feat, attention_mask
 
 
@@ -240,34 +253,38 @@ def process_batch(
     if not prepared:
         return [], skipped
 
-    # 提取特征并保存
+    # 批量提取特征（优化：一次性处理整个 batch）
     updated_records = []
-    for item in prepared:
-        record = item["record"]
-        uid = record["id"]
+    
+    if is_paired:
+        # Paired manifest: 批量提取 prompt_feat 和 target feat
+        prompt_waveforms = [item["prompt_waveform"] for item in prepared]
+        prompt_sample_rates = [item["prompt_sr"] for item in prepared]
+        target_waveforms = [item["target_waveform"] for item in prepared]
+        target_sample_rates = [item["target_sr"] for item in prepared]
         
-        if item["is_paired"]:
-            # Paired: 提取 prompt_feat 和 target feat
-            prompt_waveforms = [item["prompt_waveform"]]
-            prompt_sample_rates = [item["prompt_sr"]]
-            prompt_feat, _ = semantic_extractor.extract(prompt_waveforms, prompt_sample_rates)
-            prompt_feat_np = prompt_feat.detach().cpu().numpy().astype(np.float32)[0]
-            
-            target_waveforms = [item["target_waveform"]]
-            target_sample_rates = [item["target_sr"]]
-            target_feat, _ = semantic_extractor.extract(target_waveforms, target_sample_rates)
-            target_feat_np = target_feat.detach().cpu().numpy().astype(np.float32)[0]
+        # 批量提取 prompt_feat
+        prompt_feat, _ = semantic_extractor.extract(prompt_waveforms, prompt_sample_rates)
+        prompt_feat_np = prompt_feat.detach().cpu().numpy().astype(np.float32)
+        
+        # 批量提取 target feat
+        target_feat, _ = semantic_extractor.extract(target_waveforms, target_sample_rates)
+        target_feat_np = target_feat.detach().cpu().numpy().astype(np.float32)
+        
+        # 保存并更新记录
+        for idx, item in enumerate(prepared):
+            record = item["record"]
             
             # 保存 prompt_feat（使用 prompt_id 作为文件名）
             prompt_id = record.get("prompt_id", record.get("id", "").split("__")[1] if "__" in record.get("id", "") else "")
             if prompt_id:
                 prompt_feat_path = feat_dir / f"{prompt_id}.npy"
-                save_numpy(prompt_feat_path, prompt_feat_np)
+                save_numpy(prompt_feat_path, prompt_feat_np[idx])
             
             # 保存 target feat（使用 target_id 或 id 作为文件名）
             target_id = record.get("target_id", record.get("id", "").split("__")[0] if "__" in record.get("id", "") else record.get("id", ""))
             target_feat_path = feat_dir / f"{target_id}.npy"
-            save_numpy(target_feat_path, target_feat_np)
+            save_numpy(target_feat_path, target_feat_np[idx])
             
             # 更新 record（保持与 build_gpt_prompt_pairs.py 生成的格式一致）
             updated_record = record.copy()
@@ -275,29 +292,38 @@ def process_batch(
                 # 确保 prompt_feat_path 是绝对路径，然后计算相对路径
                 prompt_feat_path_abs = Path(prompt_feat_path).resolve()
                 updated_record["prompt_feat_path"] = prompt_feat_path_abs.relative_to(output_root).as_posix()
-                updated_record["prompt_feat_len"] = int(prompt_feat_np.shape[0])
+                updated_record["prompt_feat_len"] = int(prompt_feat_np[idx].shape[0])
             # target 的 feat_path（保持与现有格式一致，使用 feat_path 而不是 target_feat_path）
             target_feat_path_abs = Path(target_feat_path).resolve()
             updated_record["feat_path"] = target_feat_path_abs.relative_to(output_root).as_posix()
-            updated_record["feat_len"] = int(target_feat_np.shape[0])
-        else:
-            # Single: 提取一个 feat
-            waveforms = [item["waveform"]]
-            sample_rates = [item["sr"]]
-            feat, _ = semantic_extractor.extract(waveforms, sample_rates)
-            feat_np = feat.detach().cpu().numpy().astype(np.float32)[0]
+            updated_record["feat_len"] = int(target_feat_np[idx].shape[0])
+            
+            updated_records.append(updated_record)
+    else:
+        # Single manifest: 批量提取 feat
+        waveforms = [item["waveform"] for item in prepared]
+        sample_rates = [item["sr"] for item in prepared]
+        
+        # 批量提取特征
+        feat, _ = semantic_extractor.extract(waveforms, sample_rates)
+        feat_np = feat.detach().cpu().numpy().astype(np.float32)
+        
+        # 保存并更新记录
+        for idx, item in enumerate(prepared):
+            record = item["record"]
+            uid = record["id"]
             
             feat_path = feat_dir / f"{uid}.npy"
-            save_numpy(feat_path, feat_np)
+            save_numpy(feat_path, feat_np[idx])
             
             # 更新 record
             updated_record = record.copy()
             # 确保 feat_path 是绝对路径
             feat_path_abs = Path(feat_path).resolve()
             updated_record["feat_path"] = feat_path_abs.relative_to(output_root).as_posix()
-            updated_record["feat_len"] = int(feat_np.shape[0])
-        
-        updated_records.append(updated_record)
+            updated_record["feat_len"] = int(feat_np[idx].shape[0])
+            
+            updated_records.append(updated_record)
 
     return updated_records, skipped
 
@@ -334,8 +360,8 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="批处理大小",
+        default=32,
+        help="批处理大小（建议 32-64，GPU 内存允许的话可以更大）",
     )
     parser.add_argument(
         "--num-workers",
