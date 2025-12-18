@@ -8,12 +8,27 @@
 3. 保存 feat 到文件
 4. 更新 manifest 添加 feat_path 字段
 
-用法：
-    python tools/extract_feat_incremental.py \
-        --manifest th_processed_data/gpt_pairs_train.jsonl \
-        --output-dir th_processed_data \
-        --config checkpoints/config_finetune.yaml \
-        --audio-root /data/sky/dataset-maker/datasets_folder/th/
+**推荐流程**：
+1. 先处理原始 single manifest（train_manifest.jsonl, val_manifest.jsonl）：
+   python tools/extract_feat_incremental.py \
+       --manifest th_processed_data/train_manifest.jsonl \
+       --output-dir th_processed_data \
+       --config checkpoints/config_finetune.yaml \
+       --audio-root /data/sky/dataset-maker/datasets_folder/th/ \
+       --batch-size 32
+
+2. 然后重新生成 paired manifest（会自动包含 feat_path）：
+   python tools/build_gpt_prompt_pairs.py \
+       --manifest th_processed_data/train_manifest.jsonl \
+       --output th_processed_data/gpt_pairs_train.jsonl
+
+**如果已经生成了 paired manifest**，也可以直接处理：
+   python tools/extract_feat_incremental.py \
+       --manifest th_processed_data/gpt_pairs_train.jsonl \
+       --output-dir th_processed_data \
+       --config checkpoints/config_finetune.yaml \
+       --audio-root /data/sky/dataset-maker/datasets_folder/th/ \
+       --batch-size 32
 """
 
 from __future__ import annotations
