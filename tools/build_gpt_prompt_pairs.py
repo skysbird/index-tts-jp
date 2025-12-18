@@ -164,6 +164,8 @@ def build_pairs(
                     "prompt_condition_len": int(prompt.record.get("condition_len", 0)),
                     "prompt_emo_vec_path": prompt.record.get("emo_vec_path", ""),
                     "prompt_duration": prompt.record.get("duration"),
+                    "prompt_feat_path": prompt.record.get("feat_path", ""),  # 新增
+                    "prompt_feat_len": int(prompt.record.get("feat_len", 0)) if prompt.record.get("feat_len") else None,  # 新增
                     "target_id": target.id,
                     "target_audio_path": target.record.get("audio_path", ""),
                     "target_text": target.record.get("text", ""),
@@ -172,6 +174,8 @@ def build_pairs(
                     "target_codes_path": target.record["codes_path"],
                     "target_code_len": target.code_len,
                     "target_emo_vec_path": target.record.get("emo_vec_path", ""),
+                    "feat_path": target.record.get("feat_path", ""),  # 新增（target的feat）
+                    "feat_len": int(target.record.get("feat_len", 0)) if target.record.get("feat_len") else None,  # 新增
                 }
                 output.append(pair_record)
                 if max_pairs and len(output) >= max_pairs:

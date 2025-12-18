@@ -283,6 +283,7 @@ def ensure_dirs(root: Path) -> Dict[str, Path]:
         "condition": root / "condition",
         "emo": root / "emo_vec",
         "text": root / "text_ids",
+        "feat": root / "feat",  # 新增：保存原始语义特征
     }
     for path in subdirs.values():
         path.mkdir(parents=True, exist_ok=True)
@@ -417,6 +418,7 @@ def process_batch(
 
     conditioning_np = conditioning.detach().cpu().numpy().astype(np.float32)
     emo_vec_np = emo_vec.detach().cpu().numpy().astype(np.float32)
+    feat_np = feat.detach().cpu().numpy().astype(np.float32)  # 保存原始feat
 
     entries: List[Dict[str, Any]] = []
     output_root = dirs["codes"].parent
@@ -427,11 +429,13 @@ def process_batch(
         cond_path = dirs["condition"] / f"{uid}.npy"
         emo_path = dirs["emo"] / f"{uid}.npy"
         text_path = dirs["text"] / f"{uid}.npy"
+        feat_path = dirs["feat"] / f"{uid}.npy"  # 新增
 
         save_numpy(code_path, semantic_code[idx])
         save_numpy(cond_path, conditioning_np[idx])
         save_numpy(emo_path, emo_vec_np[idx])
         save_numpy(text_path, item["text_ids"])
+        save_numpy(feat_path, feat_np[idx])  # 保存feat
 
         entry = {
             "id": uid,
@@ -447,6 +451,8 @@ def process_batch(
             "condition_path": cond_path.relative_to(output_root).as_posix(),
             "condition_len": int(conditioning_np[idx].shape[0]),
             "emo_vec_path": emo_path.relative_to(output_root).as_posix(),
+            "feat_path": feat_path.relative_to(output_root).as_posix(),  # 新增
+            "feat_len": int(feat_np[idx].shape[0]),  # 新增
         }
         entries.append(entry)
 
