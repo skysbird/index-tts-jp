@@ -91,6 +91,12 @@ class TextNormalizer:
         has_chinese = bool(re.search(r"[\u4e00-\u9fff]", s))
         has_alpha = bool(re.search(r"[a-zA-Z]", s))
         is_email = self.match_email(s)
+        has_thai = bool(re.search(r"[\u0E00-\u0E7F]", s))  # 新增：检测泰语
+        
+        # 如果包含泰语字符，不应该被判断为中文
+        if has_thai:
+            return False
+        
         if has_chinese or not has_alpha or is_email:
             return True
 
@@ -145,6 +151,10 @@ class TextNormalizer:
             return True
         return False
 
+    def is_thai(self, text: str) -> bool:
+        """检测文本是否包含泰语字符（Unicode 范围 \u0E00-\u0E7F）"""
+        return bool(re.search(r"[\u0E00-\u0E7F]", text))
+
     def normalize_japanese(self, text: str) -> str:
         text = text.strip()
         if not text:
@@ -160,7 +170,10 @@ class TextNormalizer:
             return ""
         lang = language.strip().lower() if language else self.preferred_language
         if lang is None:
-            if self.is_japanese(text):
+            # 自动检测：先检查泰语，再检查日语，再检查中文，最后默认英文
+            if self.is_thai(text):
+                lang = "th"
+            elif self.is_japanese(text):
                 lang = "ja"
             elif self.use_chinese(text):
                 lang = "zh"
