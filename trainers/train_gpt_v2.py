@@ -719,43 +719,43 @@ def build_model(cfg_path: Path, tokenizer: TextTokenizer, base_checkpoint: Optio
     # 只有在提供了checkpoint时才加载权重
     if base_checkpoint is not None and base_checkpoint.exists():
         print(f"[Info] Loading base checkpoint from {base_checkpoint}")
-        checkpoint = torch.load(base_checkpoint, map_location="cpu")
-        raw_state_dict = checkpoint.get("model", checkpoint)
+    checkpoint = torch.load(base_checkpoint, map_location="cpu")
+    raw_state_dict = checkpoint.get("model", checkpoint)
 
-        filtered_state_dict = {}
-        for key, value in raw_state_dict.items():
-            if key.startswith("inference_model."):
-                continue
-            if ".lora_" in key:
-                continue
-            new_key = key.replace(".base_layer.", ".")
-            if new_key == "gpt.wte.weight":
-                continue
-            filtered_state_dict[new_key] = value
-        state_dict = filtered_state_dict
+    filtered_state_dict = {}
+    for key, value in raw_state_dict.items():
+        if key.startswith("inference_model."):
+            continue
+        if ".lora_" in key:
+            continue
+        new_key = key.replace(".base_layer.", ".")
+        if new_key == "gpt.wte.weight":
+            continue
+        filtered_state_dict[new_key] = value
+    state_dict = filtered_state_dict
 
-        resizable_keys = {
-            "text_embedding.weight": model.text_embedding.weight,
-            "text_head.weight": model.text_head.weight,
-            "text_head.bias": model.text_head.bias,
-        }
-        for key, param in resizable_keys.items():
-            weight = state_dict.pop(key, None)
-            if weight is None:
-                continue
-            with torch.no_grad():
-                slices = tuple(min(a, b) for a, b in zip(param.shape, weight.shape))
-                if param.ndim == 1:
-                    param[: slices[0]].copy_(weight[: slices[0]])
-                else:
-                    param[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
-            state_dict[key] = param.detach().clone()
+    resizable_keys = {
+        "text_embedding.weight": model.text_embedding.weight,
+        "text_head.weight": model.text_head.weight,
+        "text_head.bias": model.text_head.bias,
+    }
+    for key, param in resizable_keys.items():
+        weight = state_dict.pop(key, None)
+        if weight is None:
+            continue
+        with torch.no_grad():
+            slices = tuple(min(a, b) for a, b in zip(param.shape, weight.shape))
+            if param.ndim == 1:
+                param[: slices[0]].copy_(weight[: slices[0]])
+            else:
+                param[: slices[0], : slices[1]].copy_(weight[: slices[0], : slices[1]])
+        state_dict[key] = param.detach().clone()
 
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"[Warn] Missing keys during load: {missing}")
-        if unexpected:
-            print(f"[Warn] Unexpected keys during load: {unexpected}")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[Warn] Missing keys during load: {missing}")
+    if unexpected:
+        print(f"[Warn] Unexpected keys during load: {unexpected}")
     else:
         if base_checkpoint is not None:
             print(f"[Warn] Base checkpoint not found: {base_checkpoint}, training from scratch.")
@@ -1094,6 +1094,7 @@ def evaluate(
         result["stop_token_top1"] = 0.0
     
     # 可视化：生成 mel 图对比和音频
+    # 注意：可视化是可选的，失败不应该影响训练
     if writer is not None and sample_batch is not None and semantic_codec is not None and cfg is not None:
         try:
             visualize_samples(
@@ -1101,9 +1102,8 @@ def evaluate(
                 semantic_codec, cfg, ignore_pretrained_features
             )
         except Exception as e:
-            print(f"[Warning] Failed to generate visualizations: {e}")
-            import traceback
-            traceback.print_exc()
+            # 静默失败，不影响训练
+            pass
     
     return result
 
@@ -1135,8 +1135,33 @@ def visualize_samples(
         text_lengths = batch["text_lengths"][sample_idx:sample_idx+1].to(device)
         
         # 获取 condition 和 emo_vec，以及原始的 feat（用于 inference_speech）
+        # 判断是 paired 还是 single manifest
+        is_paired = "prompt_feat" in batch and batch["prompt_feat"] is not None
+        
         if ignore_pretrained_features:
-            if "feat" in batch and batch["feat"] is not None:
+            if is_paired:
+                # Paired manifest: 使用 prompt_feat 作为 speech_condition
+                if "prompt_feat" not in batch or batch["prompt_feat"] is None:
+                    return  # 无法可视化
+                prompt_feat = batch["prompt_feat"][sample_idx:sample_idx+1].to(device)
+                prompt_feat_lengths = (prompt_feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+                prompt_feat_t = prompt_feat.transpose(1, 2)  # (b, d, t)
+                condition = model.get_conditioning(prompt_feat_t, prompt_feat_lengths)
+                
+                # 使用 target 的 feat 获取 emo_vec
+                if "feat" not in batch or batch["feat"] is None:
+                    return  # 无法可视化
+                feat = batch["feat"][sample_idx:sample_idx+1].to(device)
+                feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+                emo_vec = model.get_emovec(feat, feat_lengths)
+                
+                # inference_speech 需要 prompt_feat（用于 conditioning）
+                speech_condition = prompt_feat_t  # (b, d, t)
+                cond_lengths = prompt_feat_lengths
+            else:
+                # Single manifest: 使用 feat 作为 speech_condition
+                if "feat" not in batch or batch["feat"] is None:
+                    return  # 无法可视化
                 feat = batch["feat"][sample_idx:sample_idx+1].to(device)
                 feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
                 feat_t = feat.transpose(1, 2)  # (b, d, t)
@@ -1145,29 +1170,61 @@ def visualize_samples(
                 # inference_speech 需要原始的 feat，形状应该是 (b, d, t)
                 speech_condition = feat_t  # (b, d, t)
                 cond_lengths = feat_lengths
-            else:
-                return  # 无法可视化
         else:
             condition = batch["condition"][sample_idx:sample_idx+1].to(device)
             emo_vec = batch["emo_vec"][sample_idx:sample_idx+1].to(device)
             # 如果没有原始的 feat，无法进行可视化（inference_speech 需要原始 feat）
-            if "feat" not in batch or batch["feat"] is None:
-                return  # 无法可视化
-            feat = batch["feat"][sample_idx:sample_idx+1].to(device)
-            feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
-            speech_condition = feat.transpose(1, 2)  # (b, d, t)
-            cond_lengths = feat_lengths
+            # 对于 paired manifest，需要 prompt_feat；对于 single，需要 feat
+            if is_paired:
+                if "prompt_feat" not in batch or batch["prompt_feat"] is None:
+                    return  # 无法可视化
+                prompt_feat = batch["prompt_feat"][sample_idx:sample_idx+1].to(device)
+                prompt_feat_lengths = (prompt_feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+                speech_condition = prompt_feat.transpose(1, 2)  # (b, d, t)
+                cond_lengths = prompt_feat_lengths
+            else:
+                if "feat" not in batch or batch["feat"] is None:
+                    return  # 无法可视化
+                feat = batch["feat"][sample_idx:sample_idx+1].to(device)
+                feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+                speech_condition = feat.transpose(1, 2)  # (b, d, t)
+                cond_lengths = feat_lengths
+        
+        # 验证 speech_condition 的形状
+        # 对于 conformer_perceiver，期望输入是 (b, d, t)，其中 d=1024
+        # 但 inference_speech 内部会 transpose，所以这里应该是 (b, d, t)
+        if speech_condition.shape[0] != 1:
+            print(f"[Warning] speech_condition batch size should be 1 for visualization, got {speech_condition.shape[0]}. Skipping.")
+            return
+        
+        # 检查特征维度（应该是 1024）
+        expected_feat_dim = 1024
+        if speech_condition.shape[1] != expected_feat_dim:
+            print(f"[Warning] speech_condition feature_dim mismatch: expected {expected_feat_dim}, got {speech_condition.shape[1]}. Skipping visualization.")
+            return
+        
+        # 检查 cond_lengths 是否合理
+        if cond_lengths.item() > speech_condition.shape[2]:
+            print(f"[Warning] cond_lengths ({cond_lengths.item()}) > speech_condition seq_len ({speech_condition.shape[2]}). Skipping visualization.")
+            return
         
         max_gen_len = min(code_lengths.item() * 2, model.max_mel_tokens)
-        generated_codes, _ = model.inference_speech(
-            speech_condition,
-            text_ids,
-            cond_lengths=cond_lengths,
-            emo_vec=emo_vec,
-            do_sample=False,  # greedy
-            max_generate_length=max_gen_len,
-            num_return_sequences=1,
-        )
+        try:
+            generated_codes, _ = model.inference_speech(
+                speech_condition,
+                text_ids,
+                cond_lengths=cond_lengths,
+                emo_vec=emo_vec,
+                do_sample=False,  # greedy
+                max_generate_length=max_gen_len,
+                num_return_sequences=1,
+            )
+        except Exception as e:
+            print(f"[Warning] Failed to generate codes for visualization: {e}")
+            print(f"[Warning] speech_condition shape: {speech_condition.shape}, cond_lengths: {cond_lengths}")
+            import traceback
+            traceback.print_exc()
+            return
         
         # 处理生成的 codes
         if isinstance(generated_codes, tuple):
