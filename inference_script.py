@@ -26,7 +26,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Dict, Optional
 
-from indextts.infer_v2_modded import IndexTTS2
+from indextts.infer_v2_modded_v2 import IndexTTS2
 
 
 def parse_args() -> argparse.Namespace:
@@ -230,6 +230,8 @@ def main() -> None:
             model_dir=str(model_dir_resolved),
             device=args.device,
             use_fp16=args.fp16,
+            use_deepspeed=False,
+            use_cuda_kernel=False,
         )
 
         engine.infer(
