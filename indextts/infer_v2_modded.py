@@ -614,6 +614,23 @@ class IndexTTS2:
                     )
 
                 gpt_gen_time += time.perf_counter() - m_start_time
+                
+                # 调试信息：检查 stop_mel_token
+                print(f"[DEBUG] Generated codes shape: {codes.shape}")
+                print(f"[DEBUG] stop_mel_token value: {self.stop_mel_token}")
+                has_stop_token = (codes == self.stop_mel_token).any().item()
+                print(f"[DEBUG] stop_mel_token in codes: {has_stop_token}")
+                if has_stop_token:
+                    stop_positions = (codes == self.stop_mel_token).nonzero(as_tuple=False)
+                    print(f"[DEBUG] stop_mel_token positions: {stop_positions}")
+                    if len(stop_positions) > 0:
+                        # stop_positions 是 (N, 2) 形状，第一列是batch，第二列是位置
+                        first_stop_pos = stop_positions[0][1].item() if stop_positions[0].numel() > 0 else None
+                        print(f"[DEBUG] First stop position (in sequence): {first_stop_pos}")
+                        print(f"[DEBUG] Codes length before stop: {first_stop_pos if first_stop_pos is not None else codes.shape[-1]}")
+                else:
+                    print(f"[WARNING] No stop_mel_token found in generated codes! Using full length: {codes.shape[-1]}")
+                
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
                     warnings.warn(
                         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
