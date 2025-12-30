@@ -1095,15 +1095,15 @@ def evaluate(
     
     # 可视化：生成 mel 图对比和音频
     # 注意：可视化是可选的，失败不应该影响训练
-    if writer is not None and sample_batch is not None and semantic_codec is not None and cfg is not None:
-        try:
-            visualize_samples(
-                model, sample_batch, sample_idx, device, writer, global_step,
-                semantic_codec, cfg, ignore_pretrained_features
-            )
-        except Exception as e:
-            # 静默失败，不影响训练
-            pass
+    # if writer is not None and sample_batch is not None and semantic_codec is not None and cfg is not None:
+    #     try:
+    #         visualize_samples(
+    #             model, sample_batch, sample_idx, device, writer, global_step,
+    #             semantic_codec, cfg, ignore_pretrained_features
+    #         )
+    #     except Exception as e:
+    #         # 静默失败，不影响训练
+    #         pass
     
     return result
 
