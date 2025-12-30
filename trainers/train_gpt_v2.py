@@ -1134,39 +1134,35 @@ def visualize_samples(
         code_lengths = batch["code_lengths"][sample_idx:sample_idx+1].to(device)
         text_lengths = batch["text_lengths"][sample_idx:sample_idx+1].to(device)
         
-        # 获取 condition 和 emo_vec
+        # 获取 condition 和 emo_vec，以及原始的 feat（用于 inference_speech）
         if ignore_pretrained_features:
             if "feat" in batch and batch["feat"] is not None:
                 feat = batch["feat"][sample_idx:sample_idx+1].to(device)
                 feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
-                feat_t = feat.transpose(1, 2)
+                feat_t = feat.transpose(1, 2)  # (b, d, t)
                 condition = model.get_conditioning(feat_t, feat_lengths)
                 emo_vec = model.get_emovec(feat, feat_lengths)
+                # inference_speech 需要原始的 feat，形状应该是 (b, d, t)
+                speech_condition = feat_t  # (b, d, t)
+                cond_lengths = feat_lengths
             else:
                 return  # 无法可视化
         else:
             condition = batch["condition"][sample_idx:sample_idx+1].to(device)
             emo_vec = batch["emo_vec"][sample_idx:sample_idx+1].to(device)
-        
-        # 准备 conditioning
-        use_speed = torch.zeros(1, dtype=torch.long, device=device)
-        duration_free = model.speed_emb(torch.zeros_like(use_speed))
-        duration_ctrl = model.speed_emb(torch.ones_like(use_speed))
-        conds = torch.cat(
-            (condition + emo_vec.unsqueeze(1), duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
-            dim=1,
-        )
-        
-        # 生成预测的 codes
-        speech_condition = condition.squeeze(0).transpose(0, 1) if condition.shape[1] == 1 else condition.squeeze(0)
-        if speech_condition.ndim == 2:
-            speech_condition = speech_condition.unsqueeze(0)
+            # 如果没有原始的 feat，无法进行可视化（inference_speech 需要原始 feat）
+            if "feat" not in batch or batch["feat"] is None:
+                return  # 无法可视化
+            feat = batch["feat"][sample_idx:sample_idx+1].to(device)
+            feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+            speech_condition = feat.transpose(1, 2)  # (b, d, t)
+            cond_lengths = feat_lengths
         
         max_gen_len = min(code_lengths.item() * 2, model.max_mel_tokens)
         generated_codes, _ = model.inference_speech(
             speech_condition,
             text_ids,
-            cond_lengths=torch.tensor([condition.shape[1]], device=device),
+            cond_lengths=cond_lengths,
             emo_vec=emo_vec,
             do_sample=False,  # greedy
             max_generate_length=max_gen_len,
