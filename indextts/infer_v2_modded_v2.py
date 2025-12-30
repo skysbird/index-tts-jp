@@ -19,7 +19,6 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
-from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
@@ -36,6 +35,69 @@ import random
 import torch.nn.functional as F
 
 class IndexTTS2:
+    @staticmethod
+    def _load_gpt_state_dict(path: str) -> dict:
+        checkpoint = torch.load(path, map_location="cpu")
+        return checkpoint.get("model", checkpoint)
+
+    @staticmethod
+    def _infer_vocab_size(state_dict: dict) -> int | None:
+        for key in ("text_embedding.weight", "text_head.weight", "text_head.bias"):
+            tensor = state_dict.get(key)
+            if tensor is not None:
+                return tensor.shape[0]
+        return None
+
+    @staticmethod
+    def _resolve_attr(module, key: str):
+        obj = module
+        for part in key.split("."):
+            obj = getattr(obj, part)
+        return obj
+
+    @staticmethod
+    def _copy_resized_weight(name: str, param, weight: torch.Tensor) -> None:
+        target = param.data
+        source = weight.to(device=target.device, dtype=target.dtype)
+        if target.shape != source.shape:
+            print(f">> Reshaping GPT parameter '{name}' from {source.shape} to {target.shape}")
+        if target.ndim == 1:
+            length = min(target.shape[0], source.shape[0])
+            target[:length].copy_(source[:length])
+        elif target.ndim == 2:
+            rows = min(target.shape[0], source.shape[0])
+            cols = min(target.shape[1], source.shape[1])
+            target[:rows, :cols].copy_(source[:rows, :cols])
+        else:
+            raise ValueError(f"Unsupported tensor rank for '{name}': {target.ndim}")
+
+    def _load_gpt_weights(self, model: UnifiedVoice, state_dict: dict) -> None:
+        filtered_state: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("inference_model."):
+                continue
+            if ".lora_" in key:
+                continue
+            new_key = key.replace(".base_layer.", ".")
+            filtered_state[new_key] = value
+
+        resizable_keys = ("text_embedding.weight", "text_head.weight", "text_head.bias")
+        resizable: dict[str, torch.Tensor] = {}
+        for key in resizable_keys:
+            tensor = filtered_state.pop(key, None)
+            if tensor is not None:
+                resizable[key] = tensor
+
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+        if missing:
+            print(f">> GPT load missing keys: {missing}")
+        if unexpected:
+            print(f">> GPT load unexpected keys: {unexpected}")
+
+        for key, weight in resizable.items():
+            param = self._resolve_attr(model, key)
+            self._copy_resized_weight(key, param, weight)
+
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
             use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False
@@ -82,9 +144,22 @@ class IndexTTS2:
 
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
-        self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
+        if not os.path.isfile(self.gpt_path):
+            raise FileNotFoundError(f"GPT checkpoint not found: {self.gpt_path}")
+        gpt_state = self._load_gpt_state_dict(self.gpt_path)
+        vocab_from_checkpoint = self._infer_vocab_size(gpt_state)
+        if vocab_from_checkpoint:
+            current_vocab = self.cfg.gpt.get("number_text_tokens", vocab_from_checkpoint)
+            if current_vocab != vocab_from_checkpoint:
+                print(
+                    f">> Adjusting GPT config vocab size from "
+                    f"{current_vocab} to {vocab_from_checkpoint} based on checkpoint."
+                )
+                self.cfg.gpt.number_text_tokens = vocab_from_checkpoint
+
+        self.gpt = UnifiedVoice(**self.cfg.gpt, use_accel=self.use_accel)
+        self._load_gpt_weights(self.gpt, gpt_state)
         self.gpt = self.gpt.to(self.device)
         if self.use_fp16:
             self.gpt.eval().half()

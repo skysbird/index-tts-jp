@@ -26,7 +26,7 @@ from pathlib import Path
 import tempfile
 from typing import Any, Dict, Optional
 
-from indextts.infer_v2 import IndexTTS2
+from indextts.infer_v2_modded import IndexTTS2
 
 
 def parse_args() -> argparse.Namespace:
