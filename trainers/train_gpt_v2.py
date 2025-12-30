@@ -998,8 +998,10 @@ def compute_losses(
         # 计算 stop_mel_token 的准确度
         stop_token_mask = (mel_targets == model.stop_mel_token) & mel_mask
         if stop_token_mask.any():
-            stop_token_logits = mel_logits[stop_token_mask]
-            stop_token_targets = mel_targets[stop_token_mask]
+            # 使用与 top1 相同的展平方式
+            stop_token_mask_flat = stop_token_mask.reshape(-1)
+            stop_token_logits = mel_logits_flat[stop_token_mask_flat]
+            stop_token_targets = mel_targets_flat[stop_token_mask_flat]
             stop_token_top1 = (stop_token_logits.argmax(dim=-1) == stop_token_targets).float().mean().item()
             metrics["stop_token_top1"] = stop_token_top1
             metrics["stop_token_count"] = stop_token_mask.sum().item()
@@ -1406,7 +1408,7 @@ def main() -> None:
         num_training_steps=total_steps,
     )
     use_amp = args.amp and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
 
     global_step = 0
     start_epoch = 0
@@ -1515,7 +1517,7 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs):
         for batch_idx, batch in enumerate(train_loader):
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 text_loss, mel_loss, metrics = compute_losses(
                     model,
                     batch,
