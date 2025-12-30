@@ -965,16 +965,22 @@ def compute_losses(
         torch.arange(text_targets.size(1), device=device).unsqueeze(0)
         < (text_lengths + 1).unsqueeze(1)
     )
+    # 方案1：修复 mask 计算，包含所有 stop_mel_token（code_lengths + 2）
     mel_mask = (
         torch.arange(mel_targets.size(1), device=device).unsqueeze(0)
-        < (code_lengths + 1).unsqueeze(1)
+        < (code_lengths + 2).unsqueeze(1)
     )
 
     text_ce = F.cross_entropy(text_logits, text_targets, reduction="none")
     mel_ce = F.cross_entropy(mel_logits, mel_targets, reduction="none")
 
+    # 方案2：增强停止位置的损失权重，给 stop_mel_token 位置更高的权重
+    stop_token_positions = (mel_targets == model.stop_mel_token)
+    # stop_mel_token 位置权重 x3，其他位置权重 x1
+    mel_ce_weighted = mel_ce * (1.0 + 2.0 * stop_token_positions.float())
+
     text_loss = (text_ce * text_mask).sum() / text_mask.sum().clamp_min(1)
-    mel_loss = (mel_ce * mel_mask).sum() / mel_mask.sum().clamp_min(1)
+    mel_loss = (mel_ce_weighted * mel_mask).sum() / mel_mask.sum().clamp_min(1)
 
     metrics = {}
     with torch.no_grad():
@@ -988,6 +994,18 @@ def compute_losses(
         else:
             top1 = 0.0
         metrics["mel_top1"] = top1
+        
+        # 计算 stop_mel_token 的准确度
+        stop_token_mask = (mel_targets == model.stop_mel_token) & mel_mask
+        if stop_token_mask.any():
+            stop_token_logits = mel_logits[stop_token_mask]
+            stop_token_targets = mel_targets[stop_token_mask]
+            stop_token_top1 = (stop_token_logits.argmax(dim=-1) == stop_token_targets).float().mean().item()
+            metrics["stop_token_top1"] = stop_token_top1
+            metrics["stop_token_count"] = stop_token_mask.sum().item()
+        else:
+            metrics["stop_token_top1"] = 0.0
+            metrics["stop_token_count"] = 0
 
     return text_loss, mel_loss, metrics
 
@@ -1025,12 +1043,18 @@ def evaluate(
     use_duration_control: bool = False,
     duration_dropout: float = 0.3,
     ignore_pretrained_features: bool = False,
+    writer: Optional[SummaryWriter] = None,
+    global_step: int = 0,
+    semantic_codec = None,
+    cfg = None,
 ) -> Dict[str, float]:
     model.eval()
-    totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0}
+    totals = {"text_loss": 0.0, "mel_loss": 0.0, "mel_top1": 0.0, "stop_token_top1": 0.0, "stop_token_count": 0.0}
     count = 0
+    sample_batch = None
+    sample_idx = None
     with torch.no_grad():
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             text_loss, mel_loss, metrics = compute_losses(
                 model,
                 batch,
@@ -1043,11 +1067,200 @@ def evaluate(
             totals["text_loss"] += text_loss.item() * bsz
             totals["mel_loss"] += mel_loss.item() * bsz
             totals["mel_top1"] += metrics["mel_top1"] * bsz
+            totals["stop_token_top1"] += metrics.get("stop_token_top1", 0.0) * metrics.get("stop_token_count", 0)
+            totals["stop_token_count"] += metrics.get("stop_token_count", 0)
             count += bsz
+            
+            # 随机选择一个 batch 用于可视化（只在第一个 batch 时选择）
+            if batch_idx == 0 and sample_batch is None:
+                sample_batch = batch
+                sample_idx = random.randint(0, bsz - 1)
+    
     model.train()
     if count == 0:
-        return {k: 0.0 for k in totals}
-    return {k: v / count for k, v in totals.items()}
+        return {k: 0.0 for k in totals if k != "stop_token_count"}
+    
+    # 计算平均值
+    result = {
+        "text_loss": totals["text_loss"] / count,
+        "mel_loss": totals["mel_loss"] / count,
+        "mel_top1": totals["mel_top1"] / count,
+    }
+    if totals["stop_token_count"] > 0:
+        result["stop_token_top1"] = totals["stop_token_top1"] / totals["stop_token_count"]
+    else:
+        result["stop_token_top1"] = 0.0
+    
+    # 可视化：生成 mel 图对比和音频
+    if writer is not None and sample_batch is not None and semantic_codec is not None and cfg is not None:
+        try:
+            visualize_samples(
+                model, sample_batch, sample_idx, device, writer, global_step,
+                semantic_codec, cfg, ignore_pretrained_features
+            )
+        except Exception as e:
+            print(f"[Warning] Failed to generate visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return result
+
+
+def visualize_samples(
+    model: UnifiedVoice,
+    batch: Dict[str, torch.Tensor],
+    sample_idx: int,
+    device: torch.device,
+    writer: SummaryWriter,
+    global_step: int,
+    semantic_codec,
+    cfg,
+    ignore_pretrained_features: bool = False,
+) -> None:
+    """生成随机样本的可视化：mel 图对比和音频"""
+    import matplotlib
+    matplotlib.use('Agg')  # 使用非交互式后端
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import io
+    
+    model.eval()
+    with torch.no_grad():
+        # 获取样本数据
+        text_ids = batch["text_ids"][sample_idx:sample_idx+1].to(device)
+        codes = batch["codes"][sample_idx:sample_idx+1].to(device)
+        code_lengths = batch["code_lengths"][sample_idx:sample_idx+1].to(device)
+        text_lengths = batch["text_lengths"][sample_idx:sample_idx+1].to(device)
+        
+        # 获取 condition 和 emo_vec
+        if ignore_pretrained_features:
+            if "feat" in batch and batch["feat"] is not None:
+                feat = batch["feat"][sample_idx:sample_idx+1].to(device)
+                feat_lengths = (feat.abs().sum(dim=-1) > 1e-6).sum(dim=1).long()
+                feat_t = feat.transpose(1, 2)
+                condition = model.get_conditioning(feat_t, feat_lengths)
+                emo_vec = model.get_emovec(feat, feat_lengths)
+            else:
+                return  # 无法可视化
+        else:
+            condition = batch["condition"][sample_idx:sample_idx+1].to(device)
+            emo_vec = batch["emo_vec"][sample_idx:sample_idx+1].to(device)
+        
+        # 准备 conditioning
+        use_speed = torch.zeros(1, dtype=torch.long, device=device)
+        duration_free = model.speed_emb(torch.zeros_like(use_speed))
+        duration_ctrl = model.speed_emb(torch.ones_like(use_speed))
+        conds = torch.cat(
+            (condition + emo_vec.unsqueeze(1), duration_ctrl.unsqueeze(1), duration_free.unsqueeze(1)),
+            dim=1,
+        )
+        
+        # 生成预测的 codes
+        speech_condition = condition.squeeze(0).transpose(0, 1) if condition.shape[1] == 1 else condition.squeeze(0)
+        if speech_condition.ndim == 2:
+            speech_condition = speech_condition.unsqueeze(0)
+        
+        max_gen_len = min(code_lengths.item() * 2, model.max_mel_tokens)
+        generated_codes, _ = model.inference_speech(
+            speech_condition,
+            text_ids,
+            cond_lengths=torch.tensor([condition.shape[1]], device=device),
+            emo_vec=emo_vec,
+            do_sample=False,  # greedy
+            max_generate_length=max_gen_len,
+            num_return_sequences=1,
+        )
+        
+        # 处理生成的 codes
+        if isinstance(generated_codes, tuple):
+            generated_codes = generated_codes[0]
+        if hasattr(generated_codes, 'sequences'):
+            generated_codes = generated_codes.sequences
+        if generated_codes.shape[0] > 1:
+            generated_codes = generated_codes[0:1]
+        
+        # 截取到 stop_mel_token
+        gen_code = generated_codes[0]
+        if model.stop_mel_token in gen_code:
+            stop_pos = (gen_code == model.stop_mel_token).nonzero(as_tuple=False)
+            if len(stop_pos) > 0:
+                gen_code = gen_code[:stop_pos[0].item()]
+        gen_code_len = len(gen_code)
+        
+        # GT codes
+        gt_code = codes[0, :code_lengths[0].item()]
+        gt_code_len = code_lengths[0].item()
+        
+        # 从 codes 恢复 mel（使用 semantic_codec）
+        try:
+            # GT mel
+            gt_codes_tensor = gt_code.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+            gt_mel_emb = semantic_codec.quantizer.vq2emb(gt_codes_tensor)  # (1, C, T)
+            gt_mel = gt_mel_emb.squeeze(0).cpu().numpy()  # (C, T)
+            
+            # Generated mel
+            gen_codes_tensor = gen_code.unsqueeze(0).unsqueeze(0)  # (1, 1, T)
+            gen_mel_emb = semantic_codec.quantizer.vq2emb(gen_codes_tensor)  # (1, C, T)
+            gen_mel = gen_mel_emb.squeeze(0).cpu().numpy()  # (C, T)
+            
+            # 创建 mel 图对比
+            fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+            
+            # GT mel
+            im1 = axes[0].imshow(gt_mel, aspect='auto', origin='lower', cmap='viridis')
+            axes[0].set_title(f'GT Mel (length={gt_code_len})')
+            axes[0].set_xlabel('Time')
+            axes[0].set_ylabel('Feature Dim')
+            plt.colorbar(im1, ax=axes[0])
+            
+            # Generated mel
+            im2 = axes[1].imshow(gen_mel, aspect='auto', origin='lower', cmap='viridis')
+            axes[1].set_title(f'Generated Mel (length={gen_code_len})')
+            axes[1].set_xlabel('Time')
+            axes[1].set_ylabel('Feature Dim')
+            plt.colorbar(im2, ax=axes[1])
+            
+            plt.tight_layout()
+            
+            # 转换为图像并添加到 tensorboard
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=100)
+            buf.seek(0)
+            img = Image.open(buf)
+            img_array = np.array(img)
+            # 转换为 (C, H, W) 格式
+            if img_array.ndim == 3:
+                writer.add_image('val/mel_comparison', img_array.transpose(2, 0, 1), global_step)
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"[Warning] Failed to generate mel visualization: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # 尝试生成音频（需要 s2mel 和 vocoder）
+        # 这里先尝试从 codes 生成简单的音频预览
+        try:
+            # 从 codes 恢复特征并生成音频预览
+            # 注意：这只是从 semantic codes 恢复的简单预览，不是完整的 s2mel + vocoder 流程
+            # 如果需要完整的音频生成，需要加载 s2mel 和 vocoder 模型
+            
+            # GT audio preview (从 codes 恢复的 mel 特征)
+            gt_codes_tensor = gt_code.unsqueeze(0).unsqueeze(0).to(device)
+            gt_mel_emb = semantic_codec.quantizer.vq2emb(gt_codes_tensor)  # (1, C, T)
+            # 转换为 mel spectrogram 格式 (80, T) 用于可视化
+            # 这里我们只保存 mel 特征，不生成完整音频（需要 s2mel + vocoder）
+            
+            # 可以添加音频生成逻辑，但需要：
+            # 1. 加载 s2mel 模型
+            # 2. 加载 vocoder (BigVGAN)
+            # 3. 完整的推理流程
+            
+        except Exception as e:
+            # 音频生成失败不影响训练
+            pass
+        
+    model.train()
 
 
 def main() -> None:
@@ -1096,6 +1309,22 @@ def main() -> None:
         print(f"[Info] Will resume from checkpoint, skipping base_checkpoint loading.")
     
     model = build_model(args.config, tokenizer, base_checkpoint_to_use, device)
+    
+    # 加载 cfg 和 semantic_codec（用于可视化）
+    cfg = OmegaConf.load(args.config)
+    semantic_codec = None
+    try:
+        from huggingface_hub import hf_hub_download
+        import safetensors
+        semantic_codec = build_semantic_codec(cfg.semantic_codec)
+        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
+        semantic_codec = semantic_codec.to(device)
+        semantic_codec.eval()
+        print("[Info] Loaded semantic_codec for visualization")
+    except Exception as e:
+        print(f"[Warning] Failed to load semantic_codec for visualization: {e}")
+        print("[Info] Visualization will be skipped")
 
     # 当 ignore_pretrained_features=True 时，使用预提取的 feat（从文件加载）
     # 不再需要 semantic_extractor、semantic_codec 或 audio_roots
@@ -1354,6 +1583,7 @@ def main() -> None:
                     writer.add_scalar("train/text_loss", text_loss.item(), global_step)
                     writer.add_scalar("train/mel_loss", mel_loss.item(), global_step)
                     writer.add_scalar("train/mel_top1", metrics["mel_top1"], global_step)
+                    writer.add_scalar("train/stop_token_top1", metrics.get("stop_token_top1", 0.0), global_step)
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
                     if grad_norm is not None:
                         writer.add_scalar("train/grad_norm", grad_norm.item(), global_step)
@@ -1374,14 +1604,19 @@ def main() -> None:
                         use_duration_control=args.use_duration_control,
                         duration_dropout=args.duration_dropout,
                         ignore_pretrained_features=args.ignore_pretrained_features,
+                        writer=writer,
+                        global_step=global_step,
+                        semantic_codec=semantic_codec,
+                        cfg=cfg,
                     )
                     writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
                     writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
                     writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+                    writer.add_scalar("val/stop_token_top1", val_metrics.get("stop_token_top1", 0.0), global_step)
                     print(
                         f"[Val] epoch={epoch + 1} step={global_step} "
                         f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
-                        f"mel_top1={val_metrics['mel_top1']:.4f}"
+                        f"mel_top1={val_metrics['mel_top1']:.4f} stop_token_top1={val_metrics.get('stop_token_top1', 0.0):.4f}"
                     )
                     if val_metrics["mel_loss"] < best_val:
                         best_val = val_metrics["mel_loss"]
@@ -1438,14 +1673,19 @@ def main() -> None:
                 use_duration_control=args.use_duration_control,
                 duration_dropout=args.duration_dropout,
                 ignore_pretrained_features=args.ignore_pretrained_features,
+                writer=writer,
+                global_step=global_step,
+                semantic_codec=semantic_codec,
+                cfg=cfg,
             )
             writer.add_scalar("val/text_loss", val_metrics["text_loss"], global_step)
             writer.add_scalar("val/mel_loss", val_metrics["mel_loss"], global_step)
             writer.add_scalar("val/mel_top1", val_metrics["mel_top1"], global_step)
+            writer.add_scalar("val/stop_token_top1", val_metrics.get("stop_token_top1", 0.0), global_step)
             print(
                 f"[Val] epoch={epoch + 1} step={global_step} "
                 f"text_loss={val_metrics['text_loss']:.4f} mel_loss={val_metrics['mel_loss']:.4f} "
-                f"mel_top1={val_metrics['mel_top1']:.4f}"
+                f"mel_top1={val_metrics['mel_top1']:.4f} stop_token_top1={val_metrics.get('stop_token_top1', 0.0):.4f}"
             )
             if val_metrics["mel_loss"] < best_val:
                 best_val = val_metrics["mel_loss"]
