@@ -34,7 +34,8 @@ dependencies = [
   "descript-audiotools==0.7.2",
   "einops>=0.8.1",
   "ffmpeg-python==0.2.0",
-  "flash-attn",
+  # flash-attn: Optional dependency for acceleration (may need to be built from source)
+  # "flash-attn",
   "g2p-en==2.1.0",
   "gradio>=5.45.0",
   "jieba==0.42.1",
@@ -60,9 +61,13 @@ dependencies = [
   "tqdm>=4.67.1",
   "transformers==4.52.1",
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
-  "triton-windows<3.5",
+  # Use "triton" on Linux, "triton-windows" on Windows.
+  "triton<3.5; sys_platform == 'linux'",
+  "triton-windows<3.5; sys_platform == 'win32'",
   "wetext>=0.0.9; sys_platform != 'linux'",
   "WeTextProcessing; sys_platform == 'linux'",
+  # flash-attn is optional and may need to be built from source
+  # If installation fails, you can install it manually or skip it (acceleration features will be disabled)
 ]
 
 [project.optional-dependencies]
@@ -73,6 +78,11 @@ webui = [
 # To install the DeepSpeed support, use `uv sync --extra deepspeed` (or `--all-extras`).
 deepspeed = [
   "deepspeed==0.17.1",
+]
+# To install flash-attn for acceleration support, use `uv sync --extra flash-attn`.
+# Note: flash-attn may need to be built from source if no pre-built wheel is available.
+flash-attn = [
+  "flash-attn",
 ]
 cu128 = [
   "torch>=2.7.1",
@@ -117,7 +127,10 @@ torchaudio = [
 torchvision = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu128" },
 ]
-flash-attn = { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp310-cp310-win_amd64.whl" }
+# flash-attn: Remove hardcoded path, let it install from PyPI or build from source
+# If you have a local wheel file, uncomment and adjust the path below:
+# flash-attn = { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp310-cp310-win_amd64.whl", marker = "sys_platform == 'win32'" }
+# flash-attn = { path = "flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp310-cp310-linux_x86_64.whl", marker = "sys_platform == 'linux'" }
 
 
 [[tool.uv.index]]
