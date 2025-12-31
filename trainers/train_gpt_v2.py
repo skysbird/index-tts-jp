@@ -125,6 +125,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum number of samples to load from each manifest (0 = unlimited, useful for quick testing).",
     )
+    parser.add_argument(
+        "--conditioning-lr-scale",
+        type=float,
+        default=0.05,
+        help="Learning rate scale for conditioning encoders when ignore_pretrained_features=True (default: 0.05, i.e., 5%% of base LR). "
+             "Lower values (0.01-0.05) stabilize stop_token learning while still allowing Thai adaptation.",
+    )
     return parser.parse_args()
 
 
@@ -838,6 +845,69 @@ def recover_features_from_codes(
     return feat, attention_mask
 
 
+def setup_optimizer_with_lr_groups(
+    model: UnifiedVoice,
+    base_lr: float,
+    weight_decay: float,
+    ignore_pretrained_features: bool,
+    conditioning_lr_scale: float = 0.05,
+) -> torch.optim.AdamW:
+    """
+    创建带有不同学习率组的优化器
+    
+    当 ignore_pretrained_features=True 时：
+    - GPT 部分（text_embedding, mel_embedding, gpt, heads等）使用正常学习率
+    - Conditioning 编码器部分使用更小的学习率（conditioning_lr_scale * base_lr）
+    这样可以：
+    1. 允许编码器缓慢适应泰语数据（支持泰语）
+    2. 避免编码器变化太快导致 stop_token 学习不稳定
+    
+    Args:
+        model: UnifiedVoice 模型
+        base_lr: 基础学习率
+        weight_decay: 权重衰减
+        ignore_pretrained_features: 是否忽略预提取特征
+        conditioning_lr_scale: 编码器的学习率缩放因子（默认 0.05，即 5%）
+    """
+    if ignore_pretrained_features:
+        # 分离参数组
+        conditioning_params = []
+        gpt_params = []
+        
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # 判断是否是 conditioning 相关的编码器
+            is_conditioning = any(x in name for x in [
+                'conditioning_encoder',
+                'perceiver_encoder',
+                'emo_conditioning_encoder',
+                'emo_perceiver_encoder',
+            ])
+            
+            if is_conditioning:
+                conditioning_params.append(param)
+            else:
+                gpt_params.append(param)
+        
+        # 创建参数组
+        param_groups = [
+            {'params': gpt_params, 'lr': base_lr, 'weight_decay': weight_decay},
+            {'params': conditioning_params, 'lr': base_lr * conditioning_lr_scale, 'weight_decay': weight_decay}
+        ]
+        
+        print(f"[Info] Using separate learning rate groups:")
+        print(f"  - GPT parameters: {len(gpt_params)} params, lr={base_lr:.2e}")
+        print(f"  - Conditioning encoders: {len(conditioning_params)} params, lr={base_lr * conditioning_lr_scale:.2e} ({conditioning_lr_scale*100:.1f}% of base)")
+        print(f"  - This allows encoders to slowly adapt to Thai data while stabilizing stop_token learning")
+        
+        return torch.optim.AdamW(param_groups, lr=base_lr, betas=(0.9, 0.96), eps=1e-8)
+    else:
+        # 标准优化器（使用预提取特征时）
+        return torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=weight_decay, betas=(0.9, 0.96), eps=1e-8)
+
+
 def compute_losses(
     model: UnifiedVoice,
     batch: Dict[str, torch.Tensor],
@@ -1436,7 +1506,13 @@ def main() -> None:
         pin_memory=use_cuda,
     )
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = setup_optimizer_with_lr_groups(
+        model,
+        args.learning_rate,
+        args.weight_decay,
+        args.ignore_pretrained_features,
+        conditioning_lr_scale=args.conditioning_lr_scale,
+    )
     total_steps = args.max_steps if args.max_steps > 0 else args.epochs * max(1, len(train_loader)) // max(1, args.grad_accumulation)
     total_steps = max(total_steps, 1)
     steps_per_epoch = max(1, len(train_loader)) // max(1, args.grad_accumulation)
