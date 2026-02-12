@@ -257,13 +257,26 @@ class SemanticExtractor:
         )
         input_features = inputs["input_features"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
-        outputs = self.semantic_model(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        feat = outputs.hidden_states[17]
-        feat = (feat - self.semantic_mean) / self.semantic_std
+        
+        # 使用混合精度加速（如果 GPU 可用）
+        if self.device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                outputs = self.semantic_model(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+                feat = outputs.hidden_states[17]
+                feat = (feat - self.semantic_mean) / self.semantic_std
+        else:
+            outputs = self.semantic_model(
+                input_features=input_features,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+            feat = outputs.hidden_states[17]
+            feat = (feat - self.semantic_mean) / self.semantic_std
+        
         return feat, attention_mask
 
 
